@@ -12,7 +12,6 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <mach/vm_region.h>
 #import <QuartzCore/QuartzCore.h>
 #import <string.h>
@@ -68,14 +67,16 @@ static int      g_rangeCount;
 
 static void pxBuildRanges(void) {
     g_rangeCount = 0;
-    mach_vm_address_t addr = 0;
+    // vm_region_recurse_64, not mach_vm_region_recurse: the mach_vm header is a
+    // deliberate #error on iOS and the 64-bit vm API is the one exported there.
+    vm_address_t addr = 0;
     while (g_rangeCount < PX_MAX_RANGES) {
-        mach_vm_size_t size = 0;
+        vm_size_t size = 0;
         natural_t depth = 0;
         vm_region_submap_info_data_64_t info;
         mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
-        kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &addr, &size, &depth,
-                                                  (vm_region_recurse_info_t)&info, &count);
+        kern_return_t kr = vm_region_recurse_64(mach_task_self(), &addr, &size, &depth,
+                                                (vm_region_recurse_info_t)&info, &count);
         if (kr != KERN_SUCCESS || size == 0) break;
         if (!info.is_submap && (info.protection & VM_PROT_READ)) {
             g_rangeLo[g_rangeCount] = addr;
