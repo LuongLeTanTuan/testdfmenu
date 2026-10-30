@@ -12,6 +12,7 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach/mach.h>
+#import <mach/mach_vm.h>
 #import <mach/vm_region.h>
 #import <QuartzCore/QuartzCore.h>
 #import <string.h>
