@@ -1,0 +1,272 @@
+# PxExtNoJB
+
+Clean-room clone of the `PxExtFFi` menu, rebuilt as a **no-jailbreak dylib** and
+wired to a real UE4 runtime reader so enemy ESP draws live actors instead of
+placeholders.
+
+No jailbreak, no Substrate, no injection framework. One dylib, injected into the
+app bundle, re-signed, sideloaded.
+
+## Layout
+
+```
+PxExtNoJB/
+├── Makefile
+├── PxMenu.m                     entry: constructor, install, foreground hook
+└── Menu/
+    ├── PxStore.h/.m             menu tree, persistence, feature registry
+    ├── PxMenuView.h/.m          the menu UI (header, master, search, 2 columns, tabs)
+    ├── PxOverlay.h/.m           ESP overlay window (display-link, drawRect)
+    ├── PxUE4.h/.mm              UE4 runtime reader: discovery, ProcessEvent, W2S
+    └── PxFloatingButton.h/.m    draggable pill button window
+```
+
+## Build
+
+```bash
+export THEOS=~/theos
+make                # -> .theos/obj/PxMenu.dylib
+```
+
+Needs Theos + iOS SDK. `arm64` only — the host app ships an arm64 slice and
+mixing in an `arm64e` slice with ptrauth would only complicate the re-sign.
+`make clean && make` after editing the menu tree in `PxStore.m`.
+
+## Inject (no jailbreak)
+
+```bash
+APP=DeltaForceClient.app
+cp .theos/obj/PxMenu.dylib "$APP/Frameworks/PxMenu.dylib"
+
+insert_dylib --strip-codesig --in-place \
+  @executable_path/Frameworks/PxMenu.dylib "$APP/DeltaForceClient"
+
+ldid -S"$APP/DeltaForceClient"
+codesign -f -s - "$APP/Frameworks/PxMenu.dylib"
+```
+
+Then install the repacked IPA (Sideloadly / AltStore / TrollStore). The app's own
+entitlements must be preserved — sign with the same provisioning profile.
+
+Verify the load command landed:
+
+```bash
+otool -L DeltaForceClient | grep PxMenu
+```
+
+## Using it
+
+- Floating **PX** pill: drag to move (position persists), tap to toggle the menu.
+- Header: status dot, FPS/frame-time, close.
+- **Master** gates the overlay globally.
+- Tabs: Gun / Hero / Melee / Visuals / Skin / UE4 / Misc.
+- Each column has its own search field; filters rows live.
+- Sliders and switches persist to `NSUserDefaults` under `px_*`.
+- Sliders start at their midpoint (FOV 90, Max Distance 525 m, Opacity 55 %), so
+  the overlay and the UI agree on first open.
+
+## ESP
+
+`Visuals → Players` enables the overlay. Every frame it asks `PxUE4` for the
+current enemy list and draws boxes/labels from real actor positions:
+
+| Control | Key | Effect |
+|---|---|---|
+| Enable players | `esp_players` | master for the ESP layer |
+| Box | `esp_box` | box draw on/off |
+| Box style | `vis_box_style` | Corner / Full / 3D |
+| Skeleton | `esp_skeleton` | bone-line sketch |
+| Health bar | `esp_health` | side bar, green → amber → red |
+| Distance | `esp_distance` | `NNN M` label |
+| Max distance | `esp_max_dist` | metres, 50–1000 |
+| Opacity | `vis_opacity` | 10–100 % |
+| Team check | `esp_team_check` | calls `BP_IsCharacterTeammate` |
+| Camera FOV | `esp_fov` | 40–140°, horizontal |
+
+The player camera is the only FOV the game exposes no UFunction for, so the
+horizontal FOV is a slider here (default 90). If boxes drift sideways at the
+screen edges, that number is the knob.
+
+## UE4 tab
+
+| Button | Does |
+|---|---|
+| **Rescan** | drops every cached pointer, runs discovery again |
+| **Dump to Documents** | writes `Documents/PxUE4.log` and shows a status toast |
+
+Nothing is hardcoded to an address. Every pointer is discovered in the running
+process, so a game update that shifts segments does not need a new build.
+
+The host is a **modified** UE4, and its object header does not match stock
+4.23–4.27. The shipped `PxExtFFi` cheat reads `UObject::Class` at `+0x08` and the
+`FName` at `+0x1C`; upstream UE4 uses `+0x10` and `+0x18`. Neither value is
+compiled in here. `pxCalibrate()` scores both against the live object array and
+keeps whichever actually resolves:
+
+| Candidate | Values tried |
+|---|---|
+| `UObject::Class` | `0x08`, `0x10` |
+| `UObject::Name` (FName) | `0x18`, `0x1C` |
+| `Outer` | derived, always `Name + 8` |
+| name-pool entry stride | `1`, `2` (entry = block + `index & mask` × stride) |
+| name-pool block shift | `16`, `17` |
+| object-array chunk shift | `16`, `17` |
+
+32 tuples × 192 sampled objects. A tuple scores a point when the object's own
+name resolves to a valid identifier and another when its class name does, and
+three more when the class-of-class is a real metaclass (`Class`, `Function`,
+`ScriptStruct`, …). That third hop is the discriminator: `FName::Number` also
+resolves to a short valid entry, so name-only scoring would accept the wrong
+offset. The winner needs ≥50 % of the sample (`score >= 96`) or discovery stops
+with `layout calibration failed`.
+
+Discovery, step by step:
+
+1. **Host image** — `_dyld_image_count` / `_dyld_get_image_name`, leaf name
+   `DeltaForceClient`, then walk `LC_SEGMENT_64` for `__DATA*` and `__TEXT`…
+2. **GNames** — scan host `__DATA*` for a pointer whose target begins
+   `08 00 4E 6F 6E 65 00` (`len=4, ASCII, "None"`). That slot is
+   `FNameEntryAllocator::Blocks[0]`; slot 0 of a UE4 name pool is always `None`.
+   `Blocks[]` holds `0x2000` pointers, `CurrentByteCursor` sits at `+0x100C8` and
+   `CurrentBlock` at `+0x100CC` — that is the pool the shipped cheat resolves
+   through, and it is what the stride/shift calibration assumes.
+3. **GObjects** — scan for the chunk-pointer slot of `TUObjectArray` and accept
+   it when the counts are sane (`1000 ≤ Num ≤ Max`), the first chunk is mapped,
+   and at least 3 of the first 8 items are heap pointers whose vtable also lands
+   inside the image. Two count layouts are tried: counts *after* the chunk list
+   (stock) and *before* it (the cheat's `+0x20` / `+0x14` / `+0x18`).
+4. **Layout calibration** — the table above. Logged, and `ready` stays `NO`
+   until it passes.
+5. **ProcessEvent** — sample class vtables, take the slot that holds the *same*
+   function pointer in ≥85 % of them, and require that function body to contain
+   `ldr w?, [x1, #0xB8]` (reads `UFunction::FunctionFlags`). That is
+   `UObject::ProcessEvent`; its index is the slot number.
+6. **Classes / UFunctions** — walk the object array by name:
+   `GPCharacterBase`, `PlayerCameraManager`, `Actor`, then their
+   `BP_IsCharacterTeammate`, `GetHealth`, `GetHealthMax`,
+   `GetCameraLocation`, `GetCameraRotation`, `K2_GetActorLocation`. The skin path
+   resolves `ModularWeaponDesc` / `GPModularWeaponDesc` and its `SetSkin` setter
+   on first use.
+
+UFunction calls go through `ProcessEvent` with `FUNC_Native (0x400)` set on the
+function, restored straight after. Memory is only ever read; the single write is
+that flag word, which is a normal mutable field of `UFunction`.
+
+### Reading `PxUE4.log`
+
+Pull it with Xcode → Devices → container, or the Files app if file sharing is on.
+What a healthy log looks like:
+
+```
+== discovered ==
+GNames blocks  0x...        <- non-zero
+GObjects slot  0x... count 0x...   <- count in the tens of thousands
+layout         class=+0x10 name=+0x18 outer=+0x20   <- winner of the calibration
+               stride=1 shift=16 chunk=16 score=192 OK
+ProcessEvent   slot 0x43    <- 0x40..0x50 for UE4.23-4.27
+ActorLocation  0x...        <- non-zero
+CameraLoc/Rot  0x... / 0x...<- non-zero
+```
+
+`score` is out of a 192-object sample; `192 OK` means every sampled object
+resolved. `FAILED` or `layout calibration failed` in the toast means no tuple fit
+— the header moved and the candidate table needs a new entry, not a new build.
+
+If `ProcessEvent slot` is `0x0`, discovery failed on the vtable heuristic — the
+overlay stays off rather than calling a bad pointer. `GNames not found` /
+`GObjects not found` in the toast means the name-pool or array heuristic missed;
+that is a layout change, not a crash.
+
+## Skin
+
+`Skin → Gun Skin ID` takes the numeric skin / appearance id and calls the
+weapon's reflected setter. Nothing is patched and no id is hardcoded.
+
+| Control | Key | Effect |
+|---|---|---|
+| Auto Re-apply | `skin_enable` | keeps the overlay link alive and re-sends the id every 2 s |
+| Gun Skin ID | `skin_gun_id` | numeric id, persisted |
+| Apply Skin | — | one call on the held weapon's descriptor |
+| Restore Default (0) | — | applies id `0` |
+| Runtime Status | — | shows the discovery line |
+
+What it does at call time:
+
+1. Resolve `UClass ModularWeaponDesc`, falling back to `GPModularWeaponDesc`.
+2. Resolve `UFunction SetSkin`, falling back to `SetSkinInfo`, then
+   `SetSkinApperanceId` (game symbols carry `_BS` / `_ES` suffixes; the runtime
+   names do not). Cached after the first success.
+3. Walk every descriptor of that class and score it by how its `Outer` chain
+   reaches the world: `+100` when the chain hits the local pawn (the character
+   within 150 uu of the camera), `+10` when it hits any known character,
+   otherwise `+1` per hop. Highest score wins.
+4. `ProcessEvent(desc, SetSkin, { int32 skinId })` — a 4-byte parameter block.
+
+Returns `1` on success, `0` when no descriptor resolved (weapon not spawned —
+hold the gun in a match), `-1` runtime not ready, `-2` class missing, `-3` setter
+missing. Each maps to a distinct toast, so a failure says which hop broke.
+
+Auto re-apply exists because the descriptor is rebuilt when you swap weapons or
+respawn. It rides the overlay display link, which now runs while **either**
+`esp_players` **or** `skin_enable` is on. With both off, nothing ticks.
+
+## What actually runs
+
+| Piece | Works now | Needs game work |
+|---|---|---|
+| Floating PX button (drag, position saved) | yes | — |
+| Menu open/close, tabs, two-column scroll | yes | — |
+| Search filters both columns live | yes | — |
+| Switch / slider / combo / text / button controls | yes | — |
+| Persistence across relaunch | yes | — |
+| Master switch gating the overlay | yes | — |
+| FPS + frame time pill | yes | — |
+| UE4 discovery + calibration + UFunction calls | yes, runtime | — |
+| **Enemy ESP (box / skeleton / health / distance)** | **yes, live actors** | tune `esp_fov` per device |
+| **Mod skin (`ModularWeaponDesc::SetSkin` via reflection)** | **yes, live descriptors** | needs a valid skin id |
+| Aimbot / no recoil / god mode / speed | toggle saves, no effect | per-feature offsets + hooks |
+
+## Antiban (anogs / Tencent ACE)
+
+`anogs` is the shipped ACE build. Strings and imports it carries, and what the
+menu does about each:
+
+| anogs signal | Meaning | What this build does |
+|---|---|---|
+| `inline_hook_opcode_dismatch`, `ms_hook_opcode`, `ms_set_inlie_hook`, `set_inline_hook_error` | snapshots code bytes, reports patches | **no inline hooks, no code patches anywhere** |
+| `_dyld_get_image_name`, `_dyld_image_count` | enumerates loaded images | dylib name is `PxMenu` inside `Frameworks/` — looks like a normal embedded framework, not Substrate/Cydia |
+| `_dlopen` | watches runtime loads | nothing is `dlopen`ed at runtime; the dylib is in the load commands |
+| `mach_vm_region_recurse`, `vm_protect` | walks regions, looks for RWX | no `mprotect`/`vm_protect`, no RWX pages, no `vm_allocate` |
+| `sysctl`, `sysctlbyname`, `ptrace` | debugger / `P_TRACED` checks | nothing attaches or traces |
+| `BopMemoryOperation.cpp`, `mrpcs_scan_thread_start_failed!`, `ms_scan_start` | memory-op and scan-thread monitoring | only reads own-process memory via plain loads |
+| `root_alert`, `debugger`, `cheat_open_id` | jailbreak / debugger / cheat ids | no jailbreak artifacts touched |
+
+Two behaviours matter more than the table:
+
+- **Discovery is lazy and capped.** Six attempts, one per 1.5 s, only while the
+  overlay has not resolved. No background threads, no busy loop, no repeated
+  scans after success.
+- **The UFunction call path is the game's own.** `ProcessEvent` is what Blueprint
+  calls itself; calling it looks like gameplay script activity, not a hook.
+
+What this does **not** do: hide the dylib from a heartbeat that already knows the
+expected image list, spoof device identity, or defeat a server-side stats check.
+If ACE adds an integrity pass over `Frameworks/`, the only fix is a different
+delivery path (re-signed app with the dylib merged, or a tweak-free build).
+
+## No key, no licence
+
+No key field, no UDID check, no server revalidation, no AES. The menu opens fully
+unlocked. (The original `PxExtFFi` gated its menu behind a UDID-bound key; that
+whole path is gone, along with its `com.chunmodvn.deltasdk.*` backend.)
+
+## Notes
+
+- `PxMenuView` renders on the menu's own `UIWindow` (`alert + 60`), overlay at
+  `alert + 50`, floating button at `alert + 100`.
+- Install retries 40× at 250 ms, then gives up. Re-asserts on foreground.
+- `PxSelfCheck()` asserts the tree is non-empty and keys are unique at install.
+- Actor list refreshes every 2 s, capped at 160 characters; camera manager is
+  cached alongside it.
+- `PxUE4` is ObjC++ (`-std=gnu++17`) because the object walker is templated.
+- iOS 15+, arm64, ARC.
