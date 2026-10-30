@@ -1,0 +1,9 @@
+Package: com.luongle.pxextnojb
+Name: PxExtNoJB
+Depends: mobilesubstrate
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: No-jailbreak clone of PxExtFFi: ESP + runtime-calibrated UE4 reader + mod skin.
+Maintainer: LuongLeTanTuan
+Author: LuongLeTanTuan
+Section: Tweaks
