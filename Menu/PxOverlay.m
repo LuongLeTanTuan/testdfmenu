@@ -67,7 +67,7 @@
     static int32_t lastSkinId;
     if ([PxStore boolForKey:@"skin_enable"]) {
         NSString *raw = [PxStore stringForKey:@"skin_gun_id"];
-        int32_t skinId = raw.length ? (int32_t)strtoul(raw.UTF8String, NULL, 10) : 0;
+        int32_t skinId = raw.length ? (int32_t)strtoul(raw.UTF8String, NULL, 0) : 0;
         CFTimeInterval now = CACurrentMediaTime();
         if (skinId != lastSkinId || now - lastSkin > 2.0) {
             lastSkinId = skinId;

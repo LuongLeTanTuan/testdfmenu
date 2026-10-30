@@ -254,6 +254,117 @@ expected image list, spoof device identity, or defeat a server-side stats check.
 If ACE adds an integrity pass over `Frameworks/`, the only fix is a different
 delivery path (re-signed app with the dylib merged, or a tweak-free build).
 
+## anogs / ACE, read from the shipped binary
+
+`Frameworks/anogs.framework/anogs` is ACE 7.7.49.57576 (`XCLOUD_VERSION_ACE_7.7.49.57576`),
+module tag `MRPCS_IOS`, 2.91 MB, arm64, no substrate imports. It has **21 exports**,
+and that is the whole surface:
+
+| Group | Exports | Note |
+|---|---|---|
+| lifecycle | `AnoSDKInit`, `AnoSDKInitEx`, `AnoSDKOnPause`, `AnoSDKOnResume`, `AnoSDKFree` | `init_info` carries `tss_sdk_send_data_to_svr` |
+| report | `AnoSDKGetReportData` `2` `3` `4`, `AnoSDKDelReportData*` | the app pulls the buffer and sends it itself |
+| server → client | `AnoSDKOnRecvData`, `AnoSDKOnRecvSignature`, `AnoSDKIoctl`, `AnoSDKIoctlOld` | kick / alert / command |
+| identity | `AnoSDKSetUserInfo`, `AnoSDKSetUserInfoWithLicense`, `AnoSDKRegistInfoListener` | |
+| ObjC | `PluginTssSDKLifecycle` | |
+
+**anogs does not send anything.** It builds a report buffer and hands it to the
+host through `AnoSDKGetReportData*`; the host's own network layer posts it. That
+single fact decides the whole approach: there is no socket to intercept, and
+blocking the upload looks exactly like a dead SDK, which is itself a signal.
+
+The export thunks are 4-byte `b` instructions packed together in `__text`, at
+fixed file offsets in this build:
+
+```
+0xf2310  AnoSDKGetReportData      stp x29,x30,[sp,#-0x10]! ... mov w0,#1 ; mov w1,#4 ; bl <engine>
+0xf239c  AnoSDKIoctlOld            b <engine>
+0xf23a0  AnoSDKIoctl               b <engine>
+0xf23a4  AnoSDKFree                b <engine>
+0xf23a8  AnoSDKGetReportData2      b <engine>
+0xf23ac  AnoSDKGetReportData3      b <engine>
+0xf23b0  AnoSDKDelReportData3      b <engine>
+0xf23b4  AnoSDKGetReportData4      b <engine>
+0xf23b8  AnoSDKDelReportData4      b <engine>
+0xf23bc  AnoSDKOnRecvSignature     b <engine>
+```
+
+## AnoMute — what is actually muted
+
+`AnoMute.dylib` (built here, injected the same way as `PxMenu`) does **not** hook
+code. It rewrites the host's own import slots for the report exports, which is a
+pointer swap in `__DATA.__la_symbol_ptr` / `__DATA.__got`, then:
+
+1. calls the real `AnoSDKGetReportData`, so anogs still collects everything;
+2. writes `<model>_raw.txt` to `Documents/AnoMute/` — the report format is not
+   documented anywhere, so it gets captured before anything is edited;
+3. if the buffer is text (`≥90 %` printable in the first 256 B), copies it,
+   neutralises the value of every known flag key, and returns the copy with the
+   **length and every separator preserved**;
+4. if the buffer is binary, passes it through untouched and says so in the log.
+
+Byte-identical length matters: the host sizes its packet from the buffer, and a
+report that shrank is as loud as a report that says `root_alert`.
+
+Flag keys scrubbed: `root_alert`, `emu_alert`, `cheat_open_id`, `s_open_id`,
+`debugger`, `check_state`, `ts2_alert`, `9010_alert`, `9005_alert`, `9014_alert`,
+`inline_hook_opcode_dismatch`, `ms_hook_opcode`, `ms_set_inlie_hook`,
+`black_module_macho`, `ms_data_crc`, `mrpcs_data_crc_error`, and the
+`ms_*` / `mrpcs_*` match-failure pairs. Identity fields (model, uid, role,
+version, timings) are never touched.
+
+`AnoSDKIoctl` is rebind-observed, not blocked — dropping server commands makes
+the client and server disagree, and that disagreement is visible.
+
+### What this does not fix
+
+| Not fixed | Why |
+|---|---|
+| `DoRiskFileTCJTask` / `tcj` file scan | `PxMenu.dylib` on disk in `Frameworks/` is still a file. The scanner sits inside 2.3 MB of obfuscated code plus an MRPCS module that carries its own CRC (`mrpcs_data_crc_error`), so patching it is a fight, not a swap. |
+| Server-side correlation | ESP / aimbot are measured statistically. No client function to rebind. |
+| Heartbeat timing | A missing or empty report is its own signal. AnoMute keeps the report full. |
+
+## Why no substrate, no rpath, no dylib dependency
+
+The usual packaging answer is: bundle `libsubstrate.dylib` in `Frameworks/`,
+add it to `LC_LOAD_DYLIB`, and set `@rpath`. It works mechanically, and it is the
+wrong move here:
+
+- Substrate's hook primitive is an inline hook — it rewrites the first
+  instructions of the target and keeps a trampoline. `inline_hook_opcode_dismatch`
+  and `ms_hook_opcode` exist in anogs precisely to compare those bytes.
+- Substrate needs `task_for_pid` / `vm_write` on a foreign task for some paths.
+  A sideloaded app has no such entitlement; the paths that survive are the ones
+  you could have written yourself.
+- Every bundled library is one more image in `_dyld_get_image_name`, and one more
+  file for the `tcj` scan.
+
+Rebinding a `__la_symbol_ptr` / `__got` entry needs none of that: `vm_protect`
+one page, write 8 bytes, restore the protection. No code page changes, no
+trampoline, no extra image.
+
+So the dylib has exactly one link dependency to worry about — the one the loader
+gives it — and the inject line is plain:
+
+```
+@executable_path/Frameworks/PxMenu.dylib
+@executable_path/Frameworks/AnoMute.dylib
+```
+
+If the host ever ships `arm64e` only, `AnoRebindEverywhere` skips non-`MH_MAGIC_64`
+headers and logs `rebind MISSED` rather than writing through a ptrauth slot.
+
+### One dylib instead of two
+
+Same Makefile builds all three libraries, so folding AnoMute into the menu is one
+line:
+
+```make
+PxMenu_FILES += AnoMute/AnoMute.m
+```
+
+Two images become one, and the inject step drops to a single `LC_LOAD_DYLIB`.
+
 ## No key, no licence
 
 No key field, no UDID check, no server revalidation, no AES. The menu opens fully

@@ -193,8 +193,12 @@ static uint64_t g_fnTeammate;
 static uint64_t g_fnHealth;
 static uint64_t g_fnHealthMax;
 
-static uint64_t g_descClass;   // UClass "ModularWeaponDesc" (skin path)
-static uint64_t g_skinSetter;  // UFunction SetSkin / SetSkinInfo / SetSkinApperanceId
+static uint64_t g_descClass;       // UClass "ModularWeaponDesc" (skin path)
+static uint64_t g_skinSetter;      // UFunction SetSkin on ModularWeaponDesc
+static uint64_t g_appDataClass;     // UClass "ModularWeaponDataComponentAppearance"
+static uint64_t g_appDataSetter;    // UFunction SetSkin on appearance data comp
+static uint64_t g_appFuncClass;     // UClass "ModularWeaponFuncComponentAppearance"
+static uint64_t g_appFuncSetter;    // UFunction SetSkin on appearance func comp
 
 static uint64_t g_camMgr;      // live APlayerCameraManager instance
 
@@ -694,6 +698,8 @@ static void pxCameraBasis(float pitchDeg, float yawDeg, PxVec3 *fwd, PxVec3 *rig
     g_fnActorLoc = g_fnCamLoc = g_fnCamRot = 0;
     g_fnTeammate = g_fnHealth = g_fnHealthMax = 0;
     g_descClass = g_skinSetter = 0;
+    g_appDataClass = g_appDataSetter = 0;
+    g_appFuncClass = g_appFuncSetter = 0;
     g_classGPChar = g_classCamMgr = g_classActor = 0;
     g_camMgr = 0;
     [g_charClasses removeAllObjects];
@@ -961,29 +967,44 @@ static uint64_t pxLocalPawn(PxVec3 camLoc) {
 - (NSInteger)applySkin:(int32_t)skinId {
     if (!self.ready) return -1;
 
-    // Class and setter are resolved once; pxFindClass walks the whole object
-    // array and the overlay re-applies every 2 s.
+    // 1. Resolve descriptor class and appearance component classes
     if (!g_descClass) {
         g_descClass = pxFindClass("ModularWeaponDesc");
         if (!g_descClass) g_descClass = pxFindClass("GPModularWeaponDesc");
     }
-    if (!g_descClass) return -2;
-    uint64_t descClass = g_descClass;
-
-    if (!g_skinSetter) {
-        static const char *kSetters[] = {
-            "SetSkin", "SetSkin_BS", "SetSkin_ES",
-            "SetSkinInfo", "SetSkinApperanceId",
-        };
-        const int n = (int)(sizeof(kSetters) / sizeof(kSetters[0]));
-        for (int i = 0; i < n && !g_skinSetter; i++)
-            g_skinSetter = pxFindFunction(descClass, kSetters[i]);
+    if (!g_appDataClass) {
+        g_appDataClass = pxFindClass("ModularWeaponDataComponentAppearance");
     }
-    if (!g_skinSetter) return -3;
-    uint64_t setter = g_skinSetter;
+    if (!g_appFuncClass) {
+        g_appFuncClass = pxFindClass("ModularWeaponFuncComponentAppearance");
+    }
+
+    if (!g_descClass && !g_appDataClass && !g_appFuncClass) return -2;
+
+    // 2. Resolve setters on descriptor or appearance components
+    static const char *kSetters[] = {
+        "SetSkin", "SetSkin_BS", "SetSkin_ES",
+        "SetSkinInfo", "SetSkinApperanceId", "ApplySkin", "SetSkinId",
+    };
+    const int n = (int)(sizeof(kSetters) / sizeof(kSetters[0]));
+    if (g_descClass && !g_skinSetter) {
+        for (int i = 0; i < n && !g_skinSetter; i++)
+            g_skinSetter = pxFindFunction(g_descClass, kSetters[i]);
+    }
+    if (g_appDataClass && !g_appDataSetter) {
+        for (int i = 0; i < n && !g_appDataSetter; i++)
+            g_appDataSetter = pxFindFunction(g_appDataClass, kSetters[i]);
+    }
+    if (g_appFuncClass && !g_appFuncSetter) {
+        for (int i = 0; i < n && !g_appFuncSetter; i++)
+            g_appFuncSetter = pxFindFunction(g_appFuncClass, kSetters[i]);
+    }
+
+    if (!g_skinSetter && !g_appDataSetter && !g_appFuncSetter) return -3;
+
     if (g_actors.count == 0) { pxRefreshActors(); g_lastActorScan = CACurrentMediaTime(); }
 
-    // Local pawn, resolved the same way the ESP does it.
+    // 3. Local pawn, resolved the same way the ESP does it.
     uint64_t pawn = 0;
     if (g_camMgr && g_fnCamLoc) {
         alignas(16) uint8_t cparms[64];
@@ -994,13 +1015,24 @@ static uint64_t pxLocalPawn(PxVec3 camLoc) {
             pawn = pxLocalPawn(camLoc);
     }
 
-    uint64_t best = 0;
-    int bestScore = -1;
+    // 4. Find candidate instances for descriptor and appearance components
+    uint64_t bestDesc = 0;
+    int bestDescScore = -1;
+    uint64_t bestAppData = 0;
+    int bestAppDataScore = -1;
+    uint64_t bestAppFunc = 0;
+    int bestAppFuncScore = -1;
+
     pxForEachObject([&](uint64_t obj) {
         uint64_t cls = 0;
-        if (!pxRd64(obj + g_classOff, &cls) || cls != descClass) return;
+        if (!pxRd64(obj + g_classOff, &cls)) return;
         uint64_t vt = 0;
         if (!pxRd64(obj, &vt) || vt == 0) return;
+
+        BOOL isDesc = (g_descClass && cls == g_descClass);
+        BOOL isAppData = (g_appDataClass && cls == g_appDataClass);
+        BOOL isAppFunc = (g_appFuncClass && cls == g_appFuncClass);
+        if (!isDesc && !isAppData && !isAppFunc) return;
 
         int score = 0;
         uint64_t o = obj;
@@ -1010,20 +1042,48 @@ static uint64_t pxLocalPawn(PxVec3 camLoc) {
             score++;
             if (pawn && o == pawn) { score += 100; break; }
             BOOL onChar = NO;
-            for (NSNumber *a in g_actors)
+            for (NSNumber *a in g_actors) {
                 if (a.unsignedLongLongValue == o) { onChar = YES; break; }
+            }
             if (onChar) { score += 10; break; }
         }
-        if (score > bestScore) { bestScore = score; best = obj; }
+
+        if (isDesc && score > bestDescScore) {
+            bestDescScore = score;
+            bestDesc = obj;
+        } else if (isAppData && score > bestAppDataScore) {
+            bestAppDataScore = score;
+            bestAppData = obj;
+        } else if (isAppFunc && score > bestAppFuncScore) {
+            bestAppFuncScore = score;
+            bestAppFunc = obj;
+        }
     });
 
-    if (!best || bestScore <= 0) return 0;
-
+    NSInteger hops = 0;
     alignas(16) uint8_t parms[32];
     memset(parms, 0, sizeof(parms));
     *(int32_t *)parms = skinId;
-    pxInvoke(best, setter, parms);
-    return 1;
+
+    // Hop 1: Descriptor
+    if (bestDesc && bestDescScore > 0 && g_skinSetter) {
+        pxInvoke(bestDesc, g_skinSetter, parms);
+        hops |= 1;
+    }
+
+    // Hop 2: Appearance Data Component
+    if (bestAppData && bestAppDataScore > 0 && g_appDataSetter) {
+        pxInvoke(bestAppData, g_appDataSetter, parms);
+        hops |= 2;
+    }
+
+    // Hop 3: Appearance Func Component
+    if (bestAppFunc && bestAppFuncScore > 0 && g_appFuncSetter) {
+        pxInvoke(bestAppFunc, g_appFuncSetter, parms);
+        hops |= 4;
+    }
+
+    return hops; // 0: no object found; bits: 1=desc, 2=appData, 4=appFunc
 }
 
 - (NSString *)dumpReport {
@@ -1046,6 +1106,8 @@ static uint64_t pxLocalPawn(PxVec3 camLoc) {
     [s appendFormat:@"Team/Health    0x%llX 0x%llX 0x%llX\n", g_fnTeammate, g_fnHealth, g_fnHealthMax];
     [s appendFormat:@"classes        GPCharacterBase 0x%llX  CameraManager 0x%llX\n",
         g_classGPChar, g_classCamMgr];
+    [s appendFormat:@"modskin        Desc 0x%llX (fn 0x%llX) AppData 0x%llX (fn 0x%llX) AppFunc 0x%llX (fn 0x%llX)\n",
+        g_descClass, g_skinSetter, g_appDataClass, g_appDataSetter, g_appFuncClass, g_appFuncSetter];
 
     if (g_nameBlocks) {
         [s appendString:@"\n== name pool sample ==\n"];

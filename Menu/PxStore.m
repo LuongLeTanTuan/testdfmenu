@@ -1,5 +1,6 @@
 #import "PxStore.h"
 #import "PxUE4.h"
+#import "PxSkinCatalog.h"
 #import <UIKit/UIKit.h>
 #import <stdlib.h>
 
@@ -214,6 +215,189 @@ static NSString * const kPxMasterKey = @"px_master";
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
+static PxTab *pxBuildSkinTab(void) {
+    PxTab *skin = [PxTab tabWithTitle:@"Skin"];
+    PxSection *skinLeft = [skin addSection:@"Catalog Picker"];
+
+    NSMutableArray<NSString *> *weaponNames = [NSMutableArray arrayWithCapacity:kPxWeaponCount];
+    for (uint32_t i = 0; i < kPxWeaponCount; i++) {
+        [weaponNames addObject:[NSString stringWithUTF8String:kPxWeaponNames[i]]];
+    }
+
+    NSInteger currentWpnIdx = [PxStore integerForKey:@"skin_weapon_idx"];
+    if (currentWpnIdx < 0 || currentWpnIdx >= (NSInteger)kPxWeaponCount) currentWpnIdx = 0;
+
+    NSArray<NSString *> *(^skinsForWeapon)(uint32_t) = ^NSArray<NSString *> *(uint32_t wIdx) {
+        uint32_t count = pxSkinCountForWeapon(wIdx);
+        NSMutableArray<NSString *> *list = [NSMutableArray arrayWithCapacity:count];
+        for (uint32_t s = 0; s < count; s++) {
+            const PxSkinEntry *entry = pxSkinForWeaponAt(wIdx, s);
+            if (entry && entry->name) {
+                [list addObject:[NSString stringWithUTF8String:entry->name]];
+            } else {
+                [list addObject:[NSString stringWithFormat:@"Skin #%u", s + 1]];
+            }
+        }
+        if (list.count == 0) [list addObject:@"Default / None"];
+        return list;
+    };
+
+    NSArray<NSString *> *initSkins = skinsForWeapon((uint32_t)currentWpnIdx);
+    NSInteger currentSkinIdx = [PxStore integerForKey:@"skin_select_idx"];
+    if (currentSkinIdx < 0 || currentSkinIdx >= (NSInteger)initSkins.count) currentSkinIdx = 0;
+
+    __block PxControl *skinCombo = nil;
+    [skinLeft addCombo:@"Weapon" key:@"skin_weapon_idx" options:weaponNames handler:^(NSInteger newWpnIdx) {
+        if (newWpnIdx < 0 || newWpnIdx >= (NSInteger)kPxWeaponCount) return;
+        [PxStore setInteger:newWpnIdx forKey:@"skin_weapon_idx"];
+        NSArray<NSString *> *newSkins = skinsForWeapon((uint32_t)newWpnIdx);
+        if (skinCombo) {
+            skinCombo.options = newSkins;
+            skinCombo.selectedIndex = 0;
+            [PxStore setInteger:0 forKey:@"skin_select_idx"];
+            const PxSkinEntry *firstSkin = pxSkinForWeaponAt((uint32_t)newWpnIdx, 0);
+            if (firstSkin) {
+                NSString *hexId = [NSString stringWithFormat:@"0x%08X", firstSkin->skinId];
+                [PxStore setString:hexId forKey:@"skin_gun_id"];
+            }
+        }
+    }];
+
+    skinCombo = [skinLeft addCombo:@"Skin" key:@"skin_select_idx" options:initSkins handler:^(NSInteger newSkinIdx) {
+        NSInteger wIdx = [PxStore integerForKey:@"skin_weapon_idx"];
+        if (wIdx < 0 || wIdx >= (NSInteger)kPxWeaponCount) wIdx = 0;
+        const PxSkinEntry *entry = pxSkinForWeaponAt((uint32_t)wIdx, (uint32_t)newSkinIdx);
+        if (entry) {
+            NSString *hexId = [NSString stringWithFormat:@"0x%08X", entry->skinId];
+            [PxStore setString:hexId forKey:@"skin_gun_id"];
+        }
+    }];
+
+    NSString *curRaw = [PxStore stringForKey:@"skin_gun_id"];
+    if (curRaw.length == 0) {
+        const PxSkinEntry *entry = pxSkinForWeaponAt((uint32_t)currentWpnIdx, (uint32_t)currentSkinIdx);
+        if (entry) {
+            [PxStore setString:[NSString stringWithFormat:@"0x%08X", entry->skinId] forKey:@"skin_gun_id"];
+        }
+    }
+
+    [skinLeft addText:@"Custom ID" key:@"skin_gun_id" placeholder:@"0x8588D162 or decimal" handler:nil];
+
+    PxSection *skinRight = [skin addRightSection:@"Actions"];
+    [skinRight addSwitch:@"Auto Re-apply" key:@"skin_enable" handler:nil];
+
+    [skinRight addButton:@"Apply Skin" handler:^{
+        NSString *raw = [[PxStore stringForKey:@"skin_gun_id"]
+                         stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        int32_t skinId = 0;
+        if (raw.length > 0) {
+            skinId = (int32_t)strtoul(raw.UTF8String, NULL, 0);
+        } else {
+            NSInteger wIdx = [PxStore integerForKey:@"skin_weapon_idx"];
+            NSInteger sIdx = [PxStore integerForKey:@"skin_select_idx"];
+            const PxSkinEntry *entry = pxSkinForWeaponAt((uint32_t)wIdx, (uint32_t)sIdx);
+            if (entry) skinId = (int32_t)entry->skinId;
+        }
+
+        if (skinId == 0) {
+            PxToast(@"Select a skin or enter a valid ID first.");
+            return;
+        }
+
+        NSInteger result = [[PxUE4 shared] applySkin:skinId];
+        switch (result) {
+            case 1:  PxToast([NSString stringWithFormat:@"Skin 0x%X applied via descriptor.", skinId]); break;
+            case 2:  PxToast([NSString stringWithFormat:@"Skin 0x%X applied via Appearance Data Component.", skinId]); break;
+            case 3:  PxToast([NSString stringWithFormat:@"Skin 0x%X applied via descriptor + Data Component.", skinId]); break;
+            case 4:  PxToast([NSString stringWithFormat:@"Skin 0x%X applied via Appearance Func Component.", skinId]); break;
+            case 5:
+            case 6:
+            case 7:  PxToast([NSString stringWithFormat:@"Skin 0x%X applied via all components (hops 0x%lX).", skinId, (long)result]); break;
+            case 0:  PxToast(@"No weapon/appearance component ready. Hold gun in match."); break;
+            case -1: PxToast(@"UE4 runtime not ready yet."); break;
+            case -2: PxToast(@"Weapon/Appearance classes not found in UE4."); break;
+            case -3: PxToast(@"SetSkin setter functions not found."); break;
+            default: PxToast([NSString stringWithFormat:@"applySkin code: %ld", (long)result]); break;
+        }
+    }];
+
+    [skinRight addButton:@"Restore Default (0)" handler:^{
+        NSInteger result = [[PxUE4 shared] applySkin:0];
+        if (result > 0) {
+            PxToast(@"Default weapon appearance restored.");
+        } else {
+            PxToast(@"Nothing to restore yet (hold weapon in match).");
+        }
+    }];
+
+    [skinRight addButton:@"Runtime Status" handler:^{
+        PxToast([[PxUE4 shared] statusLine]);
+    }];
+
+    return skin;
+}
+
+#if defined(PX_LITE)
+
+- (NSArray<PxTab *> *)buildTabs {
+    // 1. ESP / Visuals tab
+    PxTab *visuals = [PxTab tabWithTitle:@"ESP"];
+    PxSection *esp = [visuals addSection:@"Player ESP"];
+    [esp addSwitch:@"Players" key:@"esp_players" handler:nil];
+    [esp addSwitch:@"Box" key:@"esp_box" handler:nil];
+    [esp addSwitch:@"Skeleton" key:@"esp_skeleton" handler:nil];
+    [esp addSwitch:@"Distance" key:@"esp_distance" handler:nil];
+    [esp addSwitch:@"Health Bar" key:@"esp_health" handler:nil];
+    [esp addSwitch:@"Team Check" key:@"esp_team_check" handler:nil];
+    [esp addSlider:@"Max Distance" key:@"esp_max_dist" unit:@"m" min:50 max:1000 handler:nil];
+
+    PxSection *visualsRight = [visuals addRightSection:@"Render & Style"];
+    [visualsRight addSlider:@"Opacity" key:@"vis_opacity" unit:@"%" min:10 max:100 handler:nil];
+    [visualsRight addCombo:@"Box Style" key:@"vis_box_style"
+                   options:@[@"Corner", @"Full", @"3D"] handler:nil];
+    [visualsRight addCombo:@"Color" key:@"vis_color"
+                   options:@[@"Green", @"Red", @"Cyan", @"Magenta"] handler:nil];
+    [visualsRight addSlider:@"Camera FOV" key:@"esp_fov" unit:@"°" min:40 max:140 handler:nil];
+    [visualsRight addSwitch:@"Show FPS" key:@"vis_fps" handler:nil];
+
+    // 2. ModSkin Tab with full 85-weapon / 705-skin catalog picker
+    PxTab *skin = pxBuildSkinTab();
+
+    // 3. System Diagnostics & Settings tab
+    PxTab *diag = [PxTab tabWithTitle:@"System"];
+    PxSection *diagLeft = [diag addSection:@"UE4 Runtime"];
+    [diagLeft addButton:@"Rescan UE4" handler:^{
+        [[PxUE4 shared] invalidate];
+        [[PxUE4 shared] scanIfNeeded];
+        PxToast([[PxUE4 shared] statusLine]);
+    }];
+    [diagLeft addButton:@"Dump to Documents" handler:^{
+        [[PxUE4 shared] scanIfNeeded];
+        [[PxUE4 shared] dumpReport];
+        PxToast([[PxUE4 shared] statusLine]);
+    }];
+    [diagLeft addButton:@"Runtime Status" handler:^{
+        PxToast([[PxUE4 shared] statusLine]);
+    }];
+
+    PxSection *diagRight = [diag addRightSection:@"Settings"];
+    [diagRight addSwitch:@"Master Switch" key:kPxMasterKey handler:nil];
+    [diagRight addSlider:@"Menu Opacity" key:@"misc_menu_alpha" unit:@"%" min:40 max:100 handler:nil];
+    [diagRight addSwitch:@"Hide on Screenshot" key:@"misc_secure" handler:nil];
+    [diagRight addButton:@"Reset Config" handler:^{
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        for (NSString *key in ud.dictionaryRepresentation.allKeys) {
+            if ([key hasPrefix:@"px_"]) [ud removeObjectForKey:key];
+        }
+        [ud synchronize];
+        PxToast(@"Config reset to defaults.");
+    }];
+
+    return @[visuals, skin, diag];
+}
+
+#else
+
 // The menu tree. Feature handlers are the injection points where game logic
 // attaches; the shell itself is complete without them.
 - (NSArray<PxTab *> *)buildTabs {
@@ -290,32 +474,7 @@ static NSString * const kPxMasterKey = @"px_master";
     [ue4Right addSlider:@"Camera FOV" key:@"esp_fov" unit:@"°" min:40 max:140 handler:nil];
     [ue4Right addSwitch:@"Team Check" key:@"esp_team_check" handler:nil];
 
-    PxTab *skin = [PxTab tabWithTitle:@"Skin"];
-    PxSection *skinLeft = [skin addSection:@"Weapon"];
-    [skinLeft addSwitch:@"Auto Re-apply" key:@"skin_enable" handler:nil];
-    [skinLeft addText:@"Gun Skin ID" key:@"skin_gun_id" placeholder:@"numeric id" handler:nil];
-    [skinLeft addButton:@"Apply Skin" handler:^{
-        NSString *raw = [[PxStore stringForKey:@"skin_gun_id"]
-                         stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        if (raw.length == 0) { PxToast(@"Enter a skin ID first."); return; }
-        int32_t skinId = (int32_t)strtoul(raw.UTF8String, NULL, 10);
-        NSInteger result = [[PxUE4 shared] applySkin:skinId];
-        switch (result) {
-            case 1:  PxToast([NSString stringWithFormat:@"Skin %d sent to the held weapon.", skinId]); break;
-            case 0:  PxToast(@"No weapon descriptor yet. Hold the gun in a match."); break;
-            case -1: PxToast(@"UE4 runtime not ready. Check the UE4 tab."); break;
-            case -2: PxToast(@"ModularWeaponDesc class not found."); break;
-            default: PxToast(@"SetSkin function not found on the descriptor."); break;
-        }
-    }];
-    PxSection *skinRight = [skin addRightSection:@"State"];
-    [skinRight addButton:@"Restore Default (0)" handler:^{
-        NSInteger result = [[PxUE4 shared] applySkin:0];
-        PxToast(result == 1 ? @"Default skin restored." : @"Nothing to restore yet.");
-    }];
-    [skinRight addButton:@"Runtime Status" handler:^{
-        PxToast([[PxUE4 shared] statusLine]);
-    }];
+    PxTab *skin = pxBuildSkinTab();
 
     PxTab *misc = [PxTab tabWithTitle:@"Misc"];
     PxSection *miscLeft = [misc addSection:@"System"];
@@ -337,5 +496,7 @@ static NSString * const kPxMasterKey = @"px_master";
 
     return @[gun, hero, melee, visuals, skin, ue4, misc];
 }
+
+#endif
 
 @end

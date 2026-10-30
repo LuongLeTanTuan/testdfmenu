@@ -1,56 +1,39 @@
-name: Build dylib & deb
+name: build
+
 on:
   push:
     branches: [main, master]
   pull_request:
     branches: [main, master]
   workflow_dispatch:
+
 jobs:
-  build:
+  dylibs:
     runs-on: macos-latest
     steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: actions/checkout@v4
 
-      - name: Setup Theos
+      - name: Install Theos
+        uses: Randomblock1/theos-action@v1
+
+      - name: Build all libraries
         run: |
-          git clone --recursive https://github.com/theos/theos.git $HOME/theos
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          set -euo pipefail
+          make clean || true
+          make FINALPACKAGE=1 DEBUG=0
+          # A green build that emitted nothing is worse than a red one.
+          for n in PxMenu PxMenuLite AnoMute; do
+            test -f ".theos/obj/$n.dylib" || { echo "missing $n.dylib"; exit 1; }
+          done
+          ls -lh .theos/obj/*.dylib
+          for f in .theos/obj/*.dylib; do
+            echo "--- $f"
+            xcrun vtool -show-build "$f" 2>/dev/null | head -5 || true
+          done
 
-      - name: Setup iOS SDKs
-        run: |
-          git clone --quiet https://github.com/theos/sdks.git $THEOS/sdks
-
-      - name: Compile and Package (Rootless / Rootful)
-        run: |
-          # Build the dylib
-          make clean
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
-          # Build rootful fallback
-          make clean
-          make package FINALPACKAGE=1
-
-      - name: Upload .deb Artifact
+      - name: Upload dylibs
         uses: actions/upload-artifact@v4
         with:
-          name: tweak-deb-package
-          path: packages/*.deb
-
-      - name: Upload .dylib Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: tweak-dylib
-          path: .theos/obj/debug/*.dylib
-        if: always()
-
-      - name: Create Release (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            packages/*.deb
-            .theos/obj/debug/*.dylib
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: dylibs
+          path: .theos/obj/*.dylib
+          if-no-files-found: error
