@@ -1,4 +1,4 @@
-#import <UIKit/UIKit.h>
+﻿#import <UIKit/UIKit.h>
 #import "PxFloatingButton.h"
 #import "PxOverlay.h"
 #import "PxMenuView.h"
@@ -16,14 +16,14 @@ static UIWindow *PxKeyWindow(void) {
 
 static void PxSelfCheck(void) {
     NSArray<PxTab *> *tabs = [PxStore shared].tabs;
-    NSAssert(tabs.count > 0, @"PX: no tabs built");
+    NSCAssert(tabs.count > 0, @"PX: no tabs built");
     NSMutableSet *keys = [NSMutableSet set];
     for (PxTab *tab in tabs) {
         for (PxSection *section in [tab.sections arrayByAddingObjectsFromArray:tab.rightSections]) {
             for (PxControl *control in section.controls) {
-                NSAssert(control.key.length > 0, @"PX: control '%@' has no key", control.title);
+                NSCAssert(control.key.length > 0, @"PX: control '%@' has no key", control.title);
                 if ([control.key hasPrefix:@"btn_"]) continue;
-                NSAssert(![keys containsObject:control.key], @"PX: duplicate key '%@'", control.key);
+                NSCAssert(![keys containsObject:control.key], @"PX: duplicate key '%@'", control.key);
                 [keys addObject:control.key];
             }
         }

@@ -13,8 +13,8 @@ PxMenu_FILES = \
     Menu/PxUE4.mm \
     Menu/PxFloatingButton.m
 
-PxMenu_CFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -IMenu
-PxMenu_CCFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -std=gnu++17 -IMenu
+PxMenu_CFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -Wno-deprecated-declarations -IMenu
+PxMenu_CCFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -Wno-deprecated-declarations -std=gnu++17 -IMenu
 PxMenu_FRAMEWORKS = UIKit Foundation QuartzCore
 PxMenu_LDFLAGS = -undefined dynamic_lookup
 
@@ -27,7 +27,7 @@ PxMenuLite_LDFLAGS = $(PxMenu_LDFLAGS)
 # Standalone: rebinds the host's anogs import slots. Drop the inject line for
 # this one if you would rather fold it into PxMenu (see README, "One dylib").
 AnoMute_FILES = AnoMute/AnoMute.m
-AnoMute_CFLAGS = -fobjc-arc -Wall -Wno-unused-parameter
+AnoMute_CFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -Wno-deprecated-declarations
 AnoMute_FRAMEWORKS = Foundation
 AnoMute_LDFLAGS = -undefined dynamic_lookup
 
