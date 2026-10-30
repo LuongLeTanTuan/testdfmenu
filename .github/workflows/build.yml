@@ -1,0 +1,25 @@
+name: Build PxMenu.dylib
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Theos + SDK
+        run: |
+          echo "Theos/iOS SDK not pre-installed on GitHub macOS runners."
+          echo "This job verifies repo structure; actual .dylib requires"
+          echo "a custom runner with Theos + arm64 iOS SDK, or a pre-built artifact."
+      - name: Show build target
+        run: |
+          echo "make ARCHS=arm64 -> .theos/obj/PxMenu.dylib"
+          ls -la Makefile Menu/
+      - name: Upload source archive (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pxextnojb-source
+          path: .
