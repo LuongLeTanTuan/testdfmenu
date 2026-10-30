@@ -18,7 +18,8 @@
 
 #pragma mark - report buffer
 
-static const size_t kAnoReportCap = 256 * 1024;
+// A const size_t is not a constant expression in C; the buffer needs a macro.
+#define kAnoReportCap (256 * 1024)
 
 // One static buffer, never freed: the app may hand the pointer to a queue and
 // read it after we return. Freeing here, or returning malloc'd memory that the
