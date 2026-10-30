@@ -536,8 +536,8 @@ static BOOL pxBodyReadsFunctionFlags(uint64_t fn) {
     for (int i = 0; i < 0x400 / 4; i++) {
         if (!pxInHostCode((uint64_t)(w + i), 4)) break;
         uint32_t insn = w[i];
-        // ldr w<Rt>, [x1, #0xb8]   (Rn = 1, imm12 = 0x2e)
-        if ((insn & 0xFFFFFC00u) == 0xB940B820u) return YES;
+        // ldr w<Rt>, [x1, #0xb8]   (Rn = 1, imm12 = 0x2e); Rt is the low 5 bits
+        if ((insn & 0xFFFFFFE0u) == 0xB940B820u) return YES;
     }
     return NO;
 }
