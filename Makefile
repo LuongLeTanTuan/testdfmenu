@@ -1,4 +1,4 @@
-TARGET := iphone:clang:latest:15.0
+﻿TARGET := iphone:clang:latest:15.0
 ARCHS = arm64
 
 include $(THEOS)/makefiles/common.mk
@@ -16,7 +16,7 @@ PxMenu_FILES = \
 PxMenu_CFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -Wno-deprecated-declarations -IMenu
 PxMenu_CCFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -Wno-deprecated-declarations -std=gnu++17 -IMenu
 PxMenu_FRAMEWORKS = UIKit Foundation QuartzCore
-PxMenu_LDFLAGS = -undefined dynamic_lookup
+PxMenu_LDFLAGS = -undefined dynamic_lookup -Wl,-not_for_dyld_shared_cache
 
 PxMenuLite_FILES = $(PxMenu_FILES)
 PxMenuLite_CFLAGS = $(PxMenu_CFLAGS) -DPX_LITE=1
@@ -29,6 +29,6 @@ PxMenuLite_LDFLAGS = $(PxMenu_LDFLAGS)
 AnoMute_FILES = AnoMute/AnoMute.m
 AnoMute_CFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -Wno-deprecated-declarations
 AnoMute_FRAMEWORKS = Foundation
-AnoMute_LDFLAGS = -undefined dynamic_lookup
+AnoMute_LDFLAGS = -undefined dynamic_lookup -Wl,-not_for_dyld_shared_cache
 
 include $(THEOS_MAKE_PATH)/library.mk
