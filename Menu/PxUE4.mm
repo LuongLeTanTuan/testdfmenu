@@ -168,11 +168,6 @@ static BOOL pxLoadHostImage(void) {
     return NO;
 }
 
-static BOOL pxInHostData(uint64_t a, size_t len) {
-    for (int i = 0; i < g_dataCount; i++)
-        if (a >= g_data[i].lo && a + len <= g_data[i].hi) return YES;
-    return NO;
-}
 static BOOL pxInHostCode(uint64_t a, size_t len) {
     for (int i = 0; i < g_codeCount; i++)
         if (a >= g_code[i].lo && a + len <= g_code[i].hi) return YES;
