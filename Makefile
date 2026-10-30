@@ -13,8 +13,8 @@ PxMenu_FILES = \
     Menu/PxUE4.mm \
     Menu/PxFloatingButton.m
 
-PxMenu_CFLAGS = -fobjc-arc -Wall -Wno-unused-parameter
-PxMenu_CCFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -std=gnu++17
+PxMenu_CFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -IMenu
+PxMenu_CCFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -std=gnu++17 -IMenu
 PxMenu_FRAMEWORKS = UIKit Foundation QuartzCore
 PxMenu_LDFLAGS = -undefined dynamic_lookup
 
