@@ -12,7 +12,6 @@
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <mach/vm_region.h>
 #import <dlfcn.h>
 #import <stdarg.h>
@@ -491,9 +490,6 @@ static int (*gRealTaskInfo)(task_t, task_flavor_t, task_info_t, mach_msg_type_nu
 static kern_return_t (*gRealRegionRecurse)(vm_map_t, vm_address_t *, vm_size_t *,
                                            natural_t *, vm_region_recurse_info_t,
                                            mach_msg_type_number_t *);
-static kern_return_t (*gRealMachRegionRecurse)(vm_map_read_t, vm_address_t *, natural_t *,
-                                               vm_region_submap_info_data_64_t *,
-                                               mach_msg_type_number_t *, vm_size_t *);
 static void *(*gRealDlopen)(const char *, int);
 static void *(*gRealDlsym)(void *, const char *);
 static int (*gRealSysctlByName)(const char *, void *, size_t *, void *, size_t);
@@ -515,14 +511,8 @@ static kern_return_t AnoRegionRecurse(vm_map_t m, vm_address_t *a, vm_size_t *s,
     return gRealRegionRecurse ? gRealRegionRecurse(m, a, s, d, i, c) : KERN_FAILURE;
 }
 
-static kern_return_t AnoMachRegionRecurse(vm_map_read_t m, vm_address_t *a, natural_t *d,
-                                          vm_region_submap_info_data_64_t *i,
-                                          mach_msg_type_number_t *c, vm_size_t *s) {
-    ANO_TRACE(@"mach_vm_region_recurse at=0x%llX depth=%u",
-              (unsigned long long)*a, d ? *d : 0u);
-    return gRealMachRegionRecurse ? gRealMachRegionRecurse(m, a, d, i, c, s) : KERN_FAILURE;
-}
-
+// mach_vm_region_recurse is not in the iOS SDK (mach_vm.h is macOS-only), and
+// vm_region_recurse_64 covers the same walk, so that one is watched instead.
 static void *AnoDlopen(const char *path, int mode) {
     ANO_TRACE(@"dlopen %s", path ? path : "(null)");
     return gRealDlopen ? gRealDlopen(path, mode) : NULL;
@@ -555,7 +545,6 @@ static kern_return_t AnoVmRead(vm_map_read_t t, vm_address_t a, vm_offset_t *dat
 static void AnoInstallTelemetry(void) {
     gRealTaskInfo         = dlsym(RTLD_DEFAULT, "task_info");
     gRealRegionRecurse    = dlsym(RTLD_DEFAULT, "vm_region_recurse_64");
-    gRealMachRegionRecurse= dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
     gRealDlopen           = dlsym(RTLD_DEFAULT, "dlopen");
     gRealDlsym            = dlsym(RTLD_DEFAULT, "dlsym");
     gRealSysctlByName     = dlsym(RTLD_DEFAULT, "sysctlbyname");
@@ -565,13 +554,12 @@ static void AnoInstallTelemetry(void) {
     int n = 0;
     if (gRealTaskInfo && AnoRebindInAnogs("_task_info", (void *)AnoTaskInfo, NULL)) n++;
     if (gRealRegionRecurse && AnoRebindInAnogs("_vm_region_recurse_64", (void *)AnoRegionRecurse, NULL)) n++;
-    if (gRealMachRegionRecurse && AnoRebindInAnogs("_mach_vm_region_recurse", (void *)AnoMachRegionRecurse, NULL)) n++;
     if (gRealDlopen && AnoRebindInAnogs("_dlopen", (void *)AnoDlopen, NULL)) n++;
     if (gRealDlsym && AnoRebindInAnogs("_dlsym", (void *)AnoDlsym, NULL)) n++;
     if (gRealSysctlByName && AnoRebindInAnogs("_sysctlbyname", (void *)AnoSysctlByName, NULL)) n++;
     if (gRealMemmem && AnoRebindInAnogs("_memmem", (void *)AnoMemmem, NULL)) n++;
     if (gRealVmRead && AnoRebindInAnogs("_vm_read", (void *)AnoVmRead, NULL)) n++;
-    AnoLog(@"telemetry: %d/8 detection imports rebound", n);
+    AnoLog(@"telemetry: %d/7 detection imports rebound", n);
 }
 
 #pragma mark - install
