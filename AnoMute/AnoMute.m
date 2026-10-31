@@ -230,20 +230,31 @@ static size_t AnoScrub(char *buf, size_t n) {
 static void *(*gOrigGetReport)(void);
 static int   (*gOrigIoctl)(int, void *, void *, void *);
 
-static void AnoDump(const char *tag, const char *p, size_t n) {
-    static NSString *dir;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        dir = [paths.firstObject stringByAppendingPathComponent:@"AnoMute"];
-        [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                  withIntermediateDirectories:YES attributes:nil error:nil];
+// Writes on a background queue. This runs inside an anti-cheat export on a
+// thread we do not own; a synchronous write there can hold a lock the caller is
+// waiting on, and a watchdog kill looks exactly like a crash in the boot log.
+static void AnoDumpAsync(const char *tag, NSData *data) {
+    if (data.length == 0) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        static NSString *dir;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+            dir = [paths.firstObject stringByAppendingPathComponent:@"AnoMute"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                      withIntermediateDirectories:YES attributes:nil error:nil];
+        });
+        if (!dir) return;
+        NSString *f = [dir stringByAppendingPathComponent:
+                       [NSString stringWithFormat:@"%s_%u.txt", tag, (unsigned)time(NULL)]];
+        [data writeToFile:f atomically:YES];
+        NSLog(@"[AnoMute] %s %lu bytes -> %@", tag, (unsigned long)data.length, f);
     });
-    if (!dir || n == 0) return;
-    NSString *f = [dir stringByAppendingPathComponent:
-                   [NSString stringWithFormat:@"%s_%u.txt", tag, (unsigned)time(NULL)]];
-    [[NSData dataWithBytes:p length:n] writeToFile:f atomically:YES];
-    NSLog(@"[AnoMute] %s %zu bytes -> %@", tag, n, f);
+}
+
+static void AnoDump(const char *tag, const char *p, size_t n) {
+    if (!p || n == 0) return;
+    AnoDumpAsync(tag, [NSData dataWithBytes:p length:n]);
 }
 
 // How many bytes from `p` to the end of the mapping that contains it, 0 if the
@@ -303,6 +314,20 @@ static int AnoIoctl(int cmd, void *a, void *b, void *c) {
 #pragma mark - install
 
 static void AnoInstall(NSInteger attempt) {
+    // Kill switch: drop an empty file named AnoMute.off into the app's Documents
+    // folder (Files app, file sharing is on) and relaunch. No reinstall needed to
+    // find out whether a later crash is us or the anti-cheat.
+    static NSString *offPath;
+    static dispatch_once_t oncePath;
+    dispatch_once(&oncePath, ^{
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        offPath = docs ? [docs stringByAppendingPathComponent:@"AnoMute.off"] : nil;
+    });
+    if (offPath && [[NSFileManager defaultManager] fileExistsAtPath:offPath]) {
+        AnoLog(@"AnoMute.off present — rebind skipped, reports untouchable");
+        return;
+    }
+
     // dlsym on RTLD_DEFAULT, not the saved slot value: a lazy slot still holds
     // __stub_helper until first call, and calling that would be fatal.
     gOrigGetReport = dlsym(RTLD_DEFAULT, "AnoSDKGetReportData");
