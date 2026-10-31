@@ -27,7 +27,14 @@ PxMenu_FILES = \
 PxMenu_CFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -Wno-deprecated-declarations -Wno-unguarded-availability-new -IMenu $(PX_TRIPLE)
 PxMenu_CCFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -Wno-deprecated-declarations -Wno-unguarded-availability-new -std=gnu++17 -IMenu $(PX_TRIPLE)
 PxMenu_FRAMEWORKS = UIKit Foundation QuartzCore
-PxMenu_LDFLAGS = -undefined dynamic_lookup -Wl,-not_for_dyld_shared_cache $(PX_TRIPLE)
+# -u keeps +[PxEntry load] alive. ld64 dead-strips an unreferenced ObjC class,
+# and the shipped binary proved it: __objc_classname held PxControl/PxSection/
+# PxTab/PxStore/PxMenuView/PxOverlay/PxUE4/PxFloatingButton and no PxEntry, so
+# the class was never registered and +load never ran. The constructor is the
+# only entry left, and it lands in __TEXT,__init_offsets -- which dyld 3 on
+# iOS 14 does not walk. That is the "no icon, empty log" boot.
+PxMenu_LDFLAGS = -undefined dynamic_lookup -Wl,-not_for_dyld_shared_cache \
+                 -Wl,-u,_OBJC_CLASS_$$_PxEntry $(PX_TRIPLE)
 
 PxMenuLite_FILES = $(PxMenu_FILES)
 PxMenuLite_CFLAGS = $(PxMenu_CFLAGS) -DPX_LITE=1

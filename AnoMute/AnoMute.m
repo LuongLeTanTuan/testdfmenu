@@ -155,12 +155,18 @@ static BOOL AnoRebindInImage(const struct mach_header_64 *mh, const char *want,
 
 static uint32_t gAnoScanned, gAnoSkipped;
 
+// The injected image's own base, so the rebind walk and the hiding layer can
+// both recognise "ours" without string matching. Set once from dladdr.
+static void *gSelfBase;
+static const char *gSelfPath;
+
 static BOOL AnoRebindEverywhere(const char *want, void *replacement, void **outOriginal) {
     BOOL any = NO;
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         const struct mach_header *mh = _dyld_get_image_header(i);
         if (!mh || mh->magic != MH_MAGIC_64) { gAnoSkipped++; continue; }
+        if ((void *)mh == gSelfBase) { gAnoSkipped++; continue; }
         if (((const struct mach_header_64 *)mh)->flags & MH_DYLIB_IN_CACHE) { gAnoSkipped++; continue; }
         gAnoScanned++;
         if (AnoRebindInImage((const struct mach_header_64 *)mh, want, replacement, outOriginal))
@@ -321,6 +327,132 @@ static int AnoIoctl(int cmd, void *a, void *b, void *c) {
     return gOrigIoctl ? gOrigIoctl(cmd, a, b, c) : 0;
 }
 
+#pragma mark - image hiding
+
+// anogs imports exactly these four from libdyld:
+//   __dyld_image_count, __dyld_get_image_header, __dyld_get_image_name,
+//   __dyld_get_image_vmaddr_slide
+// Its whole "foreign image" check is that walk: our dylib is image N, its name
+// is PxMenu.dylib, and no amount of not-patching-code hides that. Rebind anogs'
+// own import slots and the walk returns the stock image list with no extra
+// entries -- libdyld itself is never touched, so nothing else in the process
+// notices. Same trick as the report exports: no code byte changes.
+static uint32_t (*gRealImageCount)(void);
+static const struct mach_header *(*gRealImageHeader)(uint32_t);
+static const char *(*gRealImageName)(uint32_t);
+static intptr_t (*gRealImageSlide)(uint32_t);
+
+// Defined at the bottom; used for dladdr so the image base is taken from the
+// loaded Mach-O header rather than guessed from a segment address.
+static void AnoMuteEntry(void);
+
+#define kAnoMaxImages 1024
+static uint32_t gKeep[kAnoMaxImages];
+static uint32_t gKeepCount;
+static uint32_t gKeepBuiltFor;
+
+static BOOL AnoIsOurs(const struct mach_header *mh, const char *name) {
+    if (mh && (void *)mh == gSelfBase) return YES;
+    if (!name) return NO;
+    if (gSelfPath && strcmp(name, gSelfPath) == 0) return YES;
+    if (strstr(name, "PxMenu") || strstr(name, "AnoMute")) return YES;
+    return NO;
+}
+
+// Rebuilt whenever the image count changes. dyld never unloads at a constant
+// count in this app, so count is a good enough key; a dlclose/dlopen pair that
+// keeps the total is the one case this misses.
+// shortcut: count-keyed cache, rebuild on every call if that ever bites.
+static void AnoBuildKeep(void) {
+    uint32_t n = gRealImageCount ? gRealImageCount() : 0;
+    if (n == gKeepBuiltFor) return;
+    uint32_t take = n > kAnoMaxImages ? kAnoMaxImages : n;
+    gKeepCount = 0;
+    for (uint32_t i = 0; i < take; i++) {
+        const struct mach_header *mh = gRealImageHeader(i);
+        const char *nm = gRealImageName(i);
+        if (AnoIsOurs(mh, nm)) continue;
+        gKeep[gKeepCount++] = i;
+    }
+    gKeepBuiltFor = n;
+}
+
+static uint32_t AnoImageCount(void) {
+    AnoBuildKeep();
+    return gKeepCount;
+}
+
+static const struct mach_header *AnoImageHeader(uint32_t i) {
+    AnoBuildKeep();
+    return (i < gKeepCount) ? gRealImageHeader(gKeep[i]) : NULL;
+}
+
+static const char *AnoImageName(uint32_t i) {
+    AnoBuildKeep();
+    return (i < gKeepCount) ? gRealImageName(gKeep[i]) : NULL;
+}
+
+static intptr_t AnoImageSlide(uint32_t i) {
+    AnoBuildKeep();
+    return (i < gKeepCount) ? gRealImageSlide(gKeep[i]) : 0;
+}
+
+#pragma mark - pointer attribution
+
+// proc_regionfilename answers "which file backs this page", and for our pages
+// the answer is the injected dylib's path. dladdr answers the same question for
+// a single pointer. Both get "unknown" for our range: anogs treats an
+// unattributable page the same as a page it never asked about.
+static int (*gRealRegionFile)(int, uint64_t, void *, uint32_t);
+static int (*gRealDladdr)(const void *, Dl_info *);
+
+static BOOL AnoAddressIsOurs(const void *addr) {
+    if (!gSelfBase || !addr) return NO;
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)gSelfBase;
+    uintptr_t base = (uintptr_t)gSelfBase;
+    uintptr_t p = (uintptr_t)addr;
+    const struct load_command *lc = (const struct load_command *)((const uint8_t *)mh + sizeof(*mh));
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            if (p >= base + sg->vmaddr && p < base + sg->vmaddr + sg->vmsize) return YES;
+        }
+        lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
+    }
+    return NO;
+}
+
+static int AnoRegionFile(int pid, uint64_t address, void *buffer, uint32_t bufsize) {
+    if (AnoAddressIsOurs((const void *)(uintptr_t)address)) return 0;
+    return gRealRegionFile ? gRealRegionFile(pid, address, buffer, bufsize) : 0;
+}
+
+static int AnoDladdr(const void *addr, Dl_info *info) {
+    if (AnoAddressIsOurs(addr)) {
+        if (info) memset(info, 0, sizeof(*info));
+        return 0;
+    }
+    return gRealDladdr ? gRealDladdr(addr, info) : 0;
+}
+
+// objc_getClass is the only class lookup anogs imports. Refuse our own names so
+// a name probe for the menu's classes comes back empty.
+static Class (*gRealGetClass)(const char *);
+
+static BOOL AnoIsOurClassName(const char *n) {
+    static const char *const ours[] = {
+        "PxEntry", "PxOverlay", "PxMenuView", "PxFloatingButton",
+        "PxStore", "PxTab", "PxSection", "PxControl", "PxUE4", NULL
+    };
+    for (int i = 0; ours[i]; i++) if (strcmp(n, ours[i]) == 0) return YES;
+    return NO;
+}
+
+static Class AnoGetClass(const char *name) {
+    if (name && AnoIsOurClassName(name)) return Nil;
+    return gRealGetClass ? gRealGetClass(name) : Nil;
+}
+
 #pragma mark - install
 
 static void AnoInstall(NSInteger attempt) {
@@ -342,7 +474,38 @@ static void AnoInstall(NSInteger attempt) {
     // __stub_helper until first call, and calling that would be fatal.
     gOrigGetReport = dlsym(RTLD_DEFAULT, "AnoSDKGetReportData");
     gOrigIoctl     = dlsym(RTLD_DEFAULT, "AnoSDKIoctl");
-    AnoLog(@"dlsym get=%p ioctl=%p", gOrigGetReport, gOrigIoctl);
+
+    // The originals of the hiding layer. Captured before any rebind so the
+    // wrappers always call the real libdyld/libproc/libobjc functions.
+    gRealImageCount  = dlsym(RTLD_DEFAULT, "_dyld_image_count");
+    gRealImageHeader = dlsym(RTLD_DEFAULT, "_dyld_get_image_header");
+    gRealImageName   = dlsym(RTLD_DEFAULT, "_dyld_get_image_name");
+    gRealImageSlide  = dlsym(RTLD_DEFAULT, "_dyld_get_image_vmaddr_slide");
+    gRealRegionFile  = dlsym(RTLD_DEFAULT, "proc_regionfilename");
+    gRealDladdr      = dlsym(RTLD_DEFAULT, "dladdr");
+    gRealGetClass    = dlsym(RTLD_DEFAULT, "objc_getClass");
+
+    if (!gSelfBase) {
+        Dl_info self;
+        if (dladdr((const void *)(uintptr_t)&AnoMuteEntry, &self)) {
+            gSelfBase = self.dli_fbase;
+            gSelfPath = self.dli_fname;
+        }
+    }
+    AnoLog(@"dlsym get=%p ioctl=%p self=%p", gOrigGetReport, gOrigIoctl, gSelfBase);
+
+    // The hiding layer has no dependency on anogs being mapped yet, so it goes
+    // in on the first pass -- the earlier it lands, the smaller the window in
+    // which a scan sees the injected image.
+    if (gRealImageCount && gRealImageHeader && gRealImageName && gRealImageSlide) {
+        AnoRebindEverywhere("__dyld_image_count",            (void *)AnoImageCount,  NULL);
+        AnoRebindEverywhere("__dyld_get_image_header",       (void *)AnoImageHeader, NULL);
+        AnoRebindEverywhere("__dyld_get_image_name",         (void *)AnoImageName,   NULL);
+        AnoRebindEverywhere("__dyld_get_image_vmaddr_slide", (void *)AnoImageSlide,  NULL);
+    }
+    if (gRealRegionFile) AnoRebindEverywhere("_proc_regionfilename", (void *)AnoRegionFile, NULL);
+    if (gRealDladdr)     AnoRebindEverywhere("_dladdr",              (void *)AnoDladdr,     NULL);
+    if (gRealGetClass)   AnoRebindEverywhere("_objc_getClass",       (void *)AnoGetClass,   NULL);
 
     if (!gOrigGetReport) {
         // anogs is dlopen'd by the host, and the order is not guaranteed. The
@@ -379,11 +542,11 @@ static void AnoMuteEntry(void) {
     // finished loading and the crash is below both of us.
     AnoLog(@"=== AnoMute constructor, %u dyld images ===", (unsigned)_dyld_image_count());
 
-    // 0.5 s: after the host's +load chain has had a chance to dlopen anogs, and
-    // early enough to matter -- the old 3 s start was after the reported crash.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        AnoLog(@"install start");
-        AnoInstall(0);
-    });
+    // No delay. Every framework the app links is already mapped by the time a
+    // dylib appended to LC_LOAD_DYLIB runs its constructor, anogs included, so
+    // the hiding layer can go in before the app's own +load chain starts. The
+    // 0.5 s hop the old code used left a window where a scan saw the injected
+    // image, and it also put the rebind after the first integrity sweep.
+    AnoLog(@"install start");
+    AnoInstall(0);
 }

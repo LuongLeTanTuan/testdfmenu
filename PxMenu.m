@@ -1,4 +1,4 @@
-﻿#import <UIKit/UIKit.h>
+#import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <mach-o/dyld.h>
 #import <stdarg.h>
@@ -210,9 +210,20 @@ static void PxObserveForeground(void) {
     }];
 }
 
-__attribute__((constructor))
-static void PxMenuInit(void) {
-    PxLog(@"=== PxMenu constructor, %u dyld images ===", (unsigned)_dyld_image_count());
+// One body, two entry points. Whichever fires first wins; the other is a no-op.
+// The constructor alone is not enough: the Apple linker that builds this image
+// puts static initialisers in __TEXT,__init_offsets (S_INIT_FUNC_OFFSETS) and
+// leaves __DATA,__mod_init_func empty, and dyld 3 -- iOS 14 -- does not walk
+// that section. The image loads, no line is written, no icon appears, and the
+// app looks perfectly healthy. +load comes from the ObjC class list instead,
+// which every iOS from 4 to 18 walks, so it cannot be skipped this way.
+static void PxMenuStart(const char *via) {
+    static BOOL started;
+    if (started) { PxLog(@"entry %s: already started", via); return; }
+    started = YES;
+
+    PxLog(@"=== PxMenu entry via %s, %u dyld images ===", via,
+          (unsigned)_dyld_image_count());
 
     // The marker is written just before the UI installs and removed once it
     // succeeds, so its presence here means the previous boot died mid-install.
@@ -239,3 +250,28 @@ static void PxMenuInit(void) {
         PxInstallUI(0);
     });
 }
+
+__attribute__((constructor))
+static void PxMenuInit(void) {
+    PxMenuStart("constructor");
+}
+
+// Belt and braces: this one is what actually runs on iOS 14. Keep both -- the
+// duplicated call is a single log line, and losing the menu entirely is not.
+@interface PxEntry : NSObject
+@end
+
+@implementation PxEntry
++ (void)load {
+    PxMenuStart("load");
+}
+@end
+
+// Third entry, and the one that cannot be rewritten: __DATA,__mod_init_func is
+// the init-pointer section dyld has walked since iOS 4. The linker moves
+// compiler-emitted constructors into __TEXT,__init_offsets on this toolchain,
+// which dyld 3 skips, so park the pointer here by hand. PxMenuStart's `started`
+// guard makes the extra call a single log line.
+__attribute__((used, section("__DATA,__mod_init_func")))
+static void (*const PxModInit)(void) = PxMenuInit;
+

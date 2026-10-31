@@ -10,7 +10,19 @@
 @property (nonatomic, assign) NSInteger tick;
 @end
 
-@implementation PxOverlay
+// A window created without a scene on iOS 13+ stays detached and never draws,
+// even with hidden = NO. Read it fresh every time: the scene set can be empty
+// for the first seconds of the process, and a nil captured once at creation
+// would keep the window invisible for the rest of the launch.
+static UIWindowScene *PxActiveScene(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)s;
+        }
+    }
+    return nil;
+}
+
 
 + (instancetype)shared {
     static PxOverlay *overlay;
@@ -20,7 +32,12 @@
         overlay.backgroundColor = [UIColor clearColor];
         overlay.userInteractionEnabled = NO;
         overlay.opaque = NO;
-        overlay.enabled = NO;
+        // Do NOT touch overlay.enabled here. The setter calls +install, +install
+        // calls +shared, and +shared is still inside this dispatch_once block --
+        // a re-entrant dispatch_once deadlocks the main thread, the watchdog
+        // kills the app, and the boot log stops on the line just before it
+        // (selfcheck), which is exactly the "menu never appears" report.
+        // Ivars are zeroed by alloc, so enabled is already NO.
     });
     return overlay;
 }
@@ -49,7 +66,9 @@
 
 - (void)setEnabled:(BOOL)enabled {
     _enabled = enabled;
-    if (!self.superview) [[self class] install];
+    // No install from here: +install is the caller, and re-entering it from the
+    // +shared initialiser deadlocks dispatch_once. PxInstallUI always installs
+    // before the first setEnabled:.
     // The timer drives both the box draw and the periodic skin re-apply. The
     // skin has to work without the ESP window ever coming up, so the link
     // starts on the first call and stays up for the life of the process; only
