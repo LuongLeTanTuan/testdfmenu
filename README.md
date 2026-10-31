@@ -34,6 +34,23 @@ mixing in an `arm64e` slice with ptrauth would only complicate the re-sign.
 
 ## Inject (no jailbreak)
 
+The app binary has `0x7C8` bytes of slack between the end of its load commands
+and `__TEXT,__text`, and `@executable_path/Frameworks` is already an `LC_RPATH`.
+So no `insert_dylib` and no Mac are required — `tools/inject_ipa.py` appends the
+`LC_LOAD_DYLIB` entries into that slack, copies the dylibs into `Frameworks/`,
+drops `_CodeSignature`, and repacks the IPA:
+
+```bash
+python tools/inject_ipa.py --app Payload/DeltaForceClient.app \
+    --dylib PxMenu.dylib --dylib AnoMute.dylib \
+    --out DeltaForce_PxMenu.ipa
+```
+
+`--verify-only` patches a copy and prints the resulting command count without
+writing anything. The tool refuses if the header has no room left.
+
+On a Mac the equivalent is the usual path:
+
 ```bash
 APP=DeltaForceClient.app
 cp .theos/obj/PxMenu.dylib "$APP/Frameworks/PxMenu.dylib"
@@ -45,8 +62,8 @@ ldid -S"$APP/DeltaForceClient"
 codesign -f -s - "$APP/Frameworks/PxMenu.dylib"
 ```
 
-Then install the repacked IPA (Sideloadly / AltStore / TrollStore). The app's own
-entitlements must be preserved — sign with the same provisioning profile.
+Either way, the installer re-signs the bundle. The app's own entitlements must be
+preserved — sign with the same provisioning profile.
 
 Verify the load command landed:
 
