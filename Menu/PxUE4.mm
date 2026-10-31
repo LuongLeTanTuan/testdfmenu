@@ -220,6 +220,7 @@ static uint32_t g_peIndex;      // UObject::ProcessEvent vtable slot
 static uint32_t g_objCount;
 
 static BOOL     g_nameCrypted = YES; // ansi name bytes are obfuscated in this build
+static BOOL     g_nameFallback; // Blocks[] recognised by shape, not by decoding "None"
 static uint64_t g_namePool;     // &FNamePool global, decoded from __text
 static uint64_t g_uobjArray;    // &FUObjectArray global, decoded from __text
 static int      g_staticTried;
@@ -598,6 +599,24 @@ static BOOL pxPoolWorks(uint64_t blocks, BOOL *cryptedOut) {
     return ok;
 }
 
+// The "None" probe needs the name bytes to decode with our own unmasker, and
+// this build's pool does not answer it -- every run logged pool=0x0 even though
+// the device dump shows the array plainly. What the dump does show at GNames
+// +0xC8 is 0x12C968000, 0x12C9E8000, 0x12CA68000 ...: ascending, page-aligned,
+// spaced exactly 0x80000 apart. That is the shape of Blocks[], so recognise the
+// shape instead of insisting on a decode we have not cracked.
+static BOOL pxLooksLikeBlocks(uint64_t at) {
+    uint64_t prev = 0;
+    for (int i = 0; i < 4; i++) {
+        uint64_t p = 0;
+        if (!pxRd64(at + (uint64_t)i * 8, &p) || p == 0 || (p & 7)) return NO;
+        if (!pxIn(p, 16)) return NO;
+        if (prev && p <= prev) return NO;
+        prev = p;
+    }
+    return YES;
+}
+
 static void pxResolveStatics(void) {
     // The pointers are fixed once the image is mapped, but the pool behind them
     // fills in during boot, so the validation gets a few more chances. Each
@@ -646,6 +665,20 @@ static void pxResolveStatics(void) {
                 break;
             }
         }
+
+        // Fallback, and the one the device log already proves: GNames+0xC8 is an
+        // ascending run of 0x80000-spaced pointers. Only used when the decode
+        // probe found nothing, so a build that does answer "None" keeps using
+        // that answer.
+        if (!g_nameBlocks) {
+            for (uint32_t off = 0x08; bases[0] && off <= 0x400; off += 8) {
+                if (!pxLooksLikeBlocks(bases[0] + off)) continue;
+                g_nameBlocks = bases[0] + off;
+                blkOff = (int)off;
+                g_nameFallback = YES;
+                break;
+            }
+        }
     }
 
     if (objAddr) {
@@ -660,11 +693,16 @@ static void pxResolveStatics(void) {
         static const int32_t  kMaxDelta[] = { 0x10, 8, -0xC, -0x20 };
         static const int32_t  kNumDelta[] = { 0x14, 12, -8, -0x1C };
         const int kSlots = (int)(sizeof(kSlot) / sizeof(kSlot[0]));
+        const int kDeltas = (int)(sizeof(kMaxDelta) / sizeof(kMaxDelta[0]));
 
         g_arrHasAlt = NO;
         for (int s = 0; s < kSlots && !g_objArray; s++) {
             int hits = 0;
-            for (int d = 0; d < 3; d++) {
+            // kDeltas, not 3. The fourth pair (-0x20/-0x1C) is the one the device
+            // dump points at, and the loop stopped one short of it every run --
+            // which is why GObjects reported chunks=0x0 at=+0xFFFFFFFF while the
+            // dump printed the chunk list at +0x20 and the counters at the base.
+            for (int d = 0; d < kDeltas; d++) {
                 uint32_t num = 0;
                 if (!pxProbeObjectArray(objAddr + kSlot[s], kMaxDelta[d], kNumDelta[d], &num)) continue;
                 if (hits++ == 0) {
@@ -694,8 +732,33 @@ static void pxResolveStatics(void) {
         }
     }
 
-    PxUELog(@"statics: GNames=0x%llX pool=0x%llX at=+0x%X crypted=%d GObjects=0x%llX chunks=0x%llX at=+0x%X count=0x%X",
-            namesAddr, g_nameBlocks, blkOff, (int)g_nameCrypted, objAddr, g_objArray, objOff, g_objCount);
+    // The name at index 0 is "None" in every UE build. Printing it both ways says
+    // whether the array we picked is right and whether the unmasker is: if the
+    // plaintext half of the line reads "None", only the mask is wrong; if both
+    // halves are noise, the array itself is wrong.
+    char name0raw[24] = {0}, name0dec[24] = {0};
+    if (g_nameBlocks) {
+        uint64_t blk0 = 0;
+        uint16_t hdr0 = 0;
+        if (pxRd64(g_nameBlocks, &blk0) && blk0 && pxRd16(blk0, &hdr0) &&
+            pxIn(blk0 + 2, 12)) {
+            memcpy(name0raw, (const void *)(blk0 + 2), 12);
+            for (int i = 0; i < 12; i++) {
+                unsigned char c = (unsigned char)name0raw[i];
+                name0dec[i] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+            }
+            uint32_t len0 = hdr0 >> 1;
+            if (len0 > 0 && len0 < 16) {
+                memcpy(name0dec, (const void *)(blk0 + 2), len0);
+                pxUnmask(name0dec, len0);
+                name0dec[len0] = 0;
+            }
+        }
+    }
+
+    PxUELog(@"statics: GNames=0x%llX pool=0x%llX at=+0x%X crypted=%d fb=%d name0='%s'/'%s' GObjects=0x%llX chunks=0x%llX at=+0x%X count=0x%X",
+            namesAddr, g_nameBlocks, blkOff, (int)g_nameCrypted, (int)g_nameFallback,
+            name0raw, name0dec, objAddr, g_objArray, objOff, g_objCount);
 }
 
 // ------------------------------------------------------------- calibration --

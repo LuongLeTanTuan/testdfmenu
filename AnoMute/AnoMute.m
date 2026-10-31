@@ -12,6 +12,7 @@
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
 #import <mach/mach.h>
+#import <mach/mach_vm.h>
 #import <mach/vm_region.h>
 #import <dlfcn.h>
 #import <stdarg.h>
@@ -453,6 +454,126 @@ static Class AnoGetClass(const char *name) {
     return gRealGetClass ? gRealGetClass(name) : Nil;
 }
 
+#pragma mark - detection telemetry
+
+// anogs is the only caller whose behaviour is worth watching, and wrapping libc
+// process-wide would put our code on every call in the app. These slots live in
+// anogs' own __got, so the wrapper runs for anogs and nothing else.
+//
+// Nothing is blocked here. A ban followed a scan we have not identified, and
+// guessing at which import to silence would trade a week of bans for a crash.
+// The log names the call and its argument; the next step is chosen from that.
+static BOOL AnoRebindInAnogs(const char *want, void *replacement, void **outOriginal) {
+    BOOL any = NO;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        const char *nm = _dyld_get_image_name(i);
+        if (!mh || !nm || mh->magic != MH_MAGIC_64) continue;
+        if (!strstr(nm, "anogs")) continue;
+        if (((const struct mach_header_64 *)mh)->flags & MH_DYLIB_IN_CACHE) continue;
+        if (AnoRebindInImage((const struct mach_header_64 *)mh, want, replacement, outOriginal))
+            any = YES;
+    }
+    return any;
+}
+
+// One line per function on first sight, then one per 256 calls: a scan loop can
+// call these thousands of times and a log that size cannot be read on a phone.
+#define ANO_TRACE(fmt, ...) do { \
+    static int n_; \
+    if (n_ == 0 || (n_ & 0xFF) == 0) \
+        AnoLog(@"telemetry #%d %@", n_, [NSString stringWithFormat:fmt, ##__VA_ARGS__]); \
+    n_++; \
+} while (0)
+
+static int (*gRealTaskInfo)(task_t, task_flavor_t, task_info_t, mach_msg_type_number_t *);
+static kern_return_t (*gRealRegionRecurse)(vm_map_t, vm_address_t *, vm_size_t *,
+                                           natural_t *, vm_region_recurse_info_t,
+                                           mach_msg_type_number_t *);
+static kern_return_t (*gRealMachRegionRecurse)(vm_map_read_t, vm_address_t *, natural_t *,
+                                               vm_region_submap_info_data_64_t *,
+                                               mach_msg_type_number_t *, vm_size_t *);
+static void *(*gRealDlopen)(const char *, int);
+static void *(*gRealDlsym)(void *, const char *);
+static int (*gRealSysctlByName)(const char *, void *, size_t *, void *, size_t);
+static void *(*gRealMemmem)(const void *, size_t, const void *, size_t);
+static kern_return_t (*gRealVmRead)(vm_map_read_t, vm_address_t, vm_offset_t *,
+                                    mach_msg_type_number_t *);
+
+static int AnoTaskInfo(task_t t, task_flavor_t f, task_info_t out, mach_msg_type_number_t *cnt) {
+    // TASK_DYLD_INFO (17) hands back dyld_all_image_infos, which is a second,
+    // independent image list that rebinding _dyld_* does not touch.
+    if (f == 17) ANO_TRACE(@"task_info(TASK_DYLD_INFO)");
+    return gRealTaskInfo ? gRealTaskInfo(t, f, out, cnt) : KERN_FAILURE;
+}
+
+static kern_return_t AnoRegionRecurse(vm_map_t m, vm_address_t *a, vm_size_t *s, natural_t *d,
+                                      vm_region_recurse_info_t i, mach_msg_type_number_t *c) {
+    ANO_TRACE(@"vm_region_recurse_64 at=0x%llX depth=%u",
+              (unsigned long long)*a, d ? *d : 0u);
+    return gRealRegionRecurse ? gRealRegionRecurse(m, a, s, d, i, c) : KERN_FAILURE;
+}
+
+static kern_return_t AnoMachRegionRecurse(vm_map_read_t m, vm_address_t *a, natural_t *d,
+                                          vm_region_submap_info_data_64_t *i,
+                                          mach_msg_type_number_t *c, vm_size_t *s) {
+    ANO_TRACE(@"mach_vm_region_recurse at=0x%llX depth=%u",
+              (unsigned long long)*a, d ? *d : 0u);
+    return gRealMachRegionRecurse ? gRealMachRegionRecurse(m, a, d, i, c, s) : KERN_FAILURE;
+}
+
+static void *AnoDlopen(const char *path, int mode) {
+    ANO_TRACE(@"dlopen %s", path ? path : "(null)");
+    return gRealDlopen ? gRealDlopen(path, mode) : NULL;
+}
+
+static void *AnoDlsym(void *h, const char *sym) {
+    ANO_TRACE(@"dlsym %s", sym ? sym : "(null)");
+    return gRealDlsym ? gRealDlsym(h, sym) : NULL;
+}
+
+static int AnoSysctlByName(const char *name, void *oldp, size_t *oldlenp,
+                           void *newp, size_t newlen) {
+    // kern.proc.pid.* / kern.procargs expose P_TRACED and the argument vector.
+    ANO_TRACE(@"sysctlbyname %s", name ? name : "(null)");
+    return gRealSysctlByName ? gRealSysctlByName(name, oldp, oldlenp, newp, newlen) : -1;
+}
+
+static void *AnoMemmem(const void *hay, size_t hn, const void *needle, size_t nn) {
+    ANO_TRACE(@"memmem hay=%zu needle=%zu", hn, nn);
+    return gRealMemmem ? gRealMemmem(hay, hn, needle, nn) : NULL;
+}
+
+static kern_return_t AnoVmRead(vm_map_read_t t, vm_address_t a, vm_offset_t *data,
+                               mach_msg_type_number_t *cnt) {
+    ANO_TRACE(@"vm_read at=0x%llX size=%u", (unsigned long long)a,
+              cnt ? (unsigned)*cnt : 0u);
+    return gRealVmRead ? gRealVmRead(t, a, data, cnt) : KERN_FAILURE;
+}
+
+static void AnoInstallTelemetry(void) {
+    gRealTaskInfo         = dlsym(RTLD_DEFAULT, "task_info");
+    gRealRegionRecurse    = dlsym(RTLD_DEFAULT, "vm_region_recurse_64");
+    gRealMachRegionRecurse= dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
+    gRealDlopen           = dlsym(RTLD_DEFAULT, "dlopen");
+    gRealDlsym            = dlsym(RTLD_DEFAULT, "dlsym");
+    gRealSysctlByName     = dlsym(RTLD_DEFAULT, "sysctlbyname");
+    gRealMemmem           = dlsym(RTLD_DEFAULT, "memmem");
+    gRealVmRead           = dlsym(RTLD_DEFAULT, "vm_read");
+
+    int n = 0;
+    if (gRealTaskInfo && AnoRebindInAnogs("_task_info", (void *)AnoTaskInfo, NULL)) n++;
+    if (gRealRegionRecurse && AnoRebindInAnogs("_vm_region_recurse_64", (void *)AnoRegionRecurse, NULL)) n++;
+    if (gRealMachRegionRecurse && AnoRebindInAnogs("_mach_vm_region_recurse", (void *)AnoMachRegionRecurse, NULL)) n++;
+    if (gRealDlopen && AnoRebindInAnogs("_dlopen", (void *)AnoDlopen, NULL)) n++;
+    if (gRealDlsym && AnoRebindInAnogs("_dlsym", (void *)AnoDlsym, NULL)) n++;
+    if (gRealSysctlByName && AnoRebindInAnogs("_sysctlbyname", (void *)AnoSysctlByName, NULL)) n++;
+    if (gRealMemmem && AnoRebindInAnogs("_memmem", (void *)AnoMemmem, NULL)) n++;
+    if (gRealVmRead && AnoRebindInAnogs("_vm_read", (void *)AnoVmRead, NULL)) n++;
+    AnoLog(@"telemetry: %d/8 detection imports rebound", n);
+}
+
 #pragma mark - install
 
 static void AnoInstall(NSInteger attempt) {
@@ -524,6 +645,9 @@ static void AnoInstall(NSInteger attempt) {
     BOOL any = NO;
     gAnoScanned = gAnoSkipped = 0;
     AnoLog(@"walk begin, %u images", _dyld_image_count());
+    // anogs is mapped by now, so the slots exist. Placed before the report
+    // rebinds so a scan that fires during install is already covered.
+    AnoInstallTelemetry();
     any |= AnoRebindEverywhere("_AnoSDKGetReportData",  (void *)AnoGetReport, &tmp);
     any |= AnoRebindEverywhere("_AnoSDKGetReportData2", (void *)AnoGetReport, NULL);
     any |= AnoRebindEverywhere("_AnoSDKGetReportData3", (void *)AnoGetReport, NULL);
