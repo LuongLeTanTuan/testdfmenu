@@ -141,7 +141,7 @@ screen edges, that number is the knob.
 | Button | Does |
 |---|---|
 | **Rescan** | drops every cached pointer, runs discovery again |
-| **Dump to Documents** | writes `Documents/PxUE4.log` and shows a status toast |
+| **Dump to Documents** | writes `Library/Caches/ue4/renderd.log` and shows a status toast |
 
 Nothing is hardcoded to an address. Every pointer is discovered in the running
 process, so a game update that shifts segments does not need a new build.
@@ -197,11 +197,19 @@ Discovery, step by step:
    resolves `ModularWeaponDesc` / `GPModularWeaponDesc` and its `SetSkin` setter
    on first use.
 
-UFunction calls go through `ProcessEvent` with `FUNC_Native (0x400)` set on the
-function, restored straight after. Memory is only ever read; the single write is
-that flag word, which is a normal mutable field of `UFunction`.
+UFunction calls go through `ProcessEvent`, and only when the function is not
+already flagged `FUNC_Native (0x400)`; the common path is read-only. Positions,
+health and team state are cached per actor and refreshed on a throttle (16 Hz in
+range, 2 Hz out, 24 calls per frame ceiling), so a frame issues a few dozen
+UFunction calls instead of ~20k per second — the old per-frame
+`K2_GetActorLocation` storm was the loudest thing the menu did.
 
-### Reading `PxUE4.log`
+### Reading the log
+
+The log moved out of `Documents`: it is `Library/Caches/ue4/assetdb.log` now, with
+the same content, because a container file named after the dylib is a signature
+the anti-cheat does not have to work for. Pull it with Xcode → Devices →
+container, or Filza.
 
 Pull it with Xcode → Devices → container, or the Files app if file sharing is on.
 What a healthy log looks like:

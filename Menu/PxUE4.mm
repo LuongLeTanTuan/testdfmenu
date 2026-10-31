@@ -29,14 +29,11 @@ enum {
     kUFnFlags    = 0xB8,   // UFunction::FunctionFlags
     kFnNative    = 0x400,  // FUNC_Native
     kObjStride   = 24,     // sizeof(FUObjectItem)
-    kNameBlocks  = 0x2000, // FNameEntryAllocator::Blocks capacity
 };
 
 static uint32_t g_classOff    = 0x10; // UObject::ClassPrivate   (calibrated)
 static uint32_t g_nameOff     = 0x18; // UObject::NamePrivate    (calibrated)
 static uint32_t g_outerOff    = 0x20; // UObject::OuterPrivate   (follows nameOff)
-static uint32_t g_nameStride  = 1;    // bytes per name-pool index unit
-static uint32_t g_nameShift   = 16;   // entries per name block = 1 << shift
 static uint32_t g_chunkShift  = 16;   // objects per FUObjectItem chunk
 static int32_t  g_arrMaxDelta = 8;    // MaxElements, relative to the chunk slot
 static int32_t  g_arrNumDelta = 12;   // NumElements, relative to the chunk slot
@@ -252,66 +249,147 @@ static int g_charPtrCount;
 static NSMutableArray<NSNumber *> *g_actors;      // cached character instances
 static NSString *g_status = @"not scanned";
 static CFTimeInterval g_lastActorScan;
+
+// Per-actor state that used to be re-fetched through ProcessEvent every frame.
+// K2_GetActorLocation on 160 actors at 120 Hz is ~20k UFunction calls a second,
+// which is exactly the kind of load anogs looks for. Everything below is
+// throttled instead: positions ~16 Hz in range / 2 Hz out of range, health and
+// team at 2 Hz, and a hard per-call budget so no frame can spike.
+enum { kActorMetaMax = 160, kInvokeBudget = 24 };
+typedef struct {
+    PxVec3 pos;
+    float  hp, hpMax;
+    CFTimeInterval tPos, tHp, tTeam;
+    signed char team;        // -1 unknown, 0 enemy, 1 teammate
+    BOOL   havePos;
+} PxActorMeta;
+static PxActorMeta g_actorMeta[kActorMetaMax];
 static CFTimeInterval g_lastScan;
 static int g_scanAttempts;
 static BOOL g_scanning;
 static BOOL g_published;   // the one flag the main thread may trust
 
 // ------------------------------------------------------------ name lookup --
-// Names are stored obfuscated: the length in the header stays plaintext, and
-// every byte is xored with a key derived from it, so the key needs no table.
-static void pxUnmask(char *s, uint32_t len) {
-    if (!s || len == 0) return;
-    uint32_t key;
-    switch (len % 9) {
-        case 0:  key = (len & 0x1F) + len; break;
-        case 1:  key = (len ^ 0xDF) + len; break;
-        case 2:  key = (len | 0xCF) + len; break;
-        case 3:  key = 33 * len; break;
-        case 4:  key = len + (len >> 2); break;
-        case 5:  key = 3 * len + 5; break;
-        case 6:  key = ((4 * len) | 5) + len; break;
-        case 7:  key = ((len >> 4) | 7) + len; break;
-        default: key = (len ^ 0xC) + len; break;
+// Entry header is UE5-shaped, not UE4: bit0 wide, bits1-5 probe hash, bits6-15
+// length.  The old `hdr >> 1` read a length 32x too large, so every lookup
+// failed and layout calibration could never score -- that is the whole reason
+// the ESP sat dead with `pool=0x0` and a 192-object sample of zero.
+//
+// The index split and the cipher below come straight out of the binary:
+//   0x10995f8a8  lsr  x8, x19, #0xf        block = index >> 15
+//   0x10995f8ac  and  x8, x8, #0x1fff8     ... * 8, 0x4000 blocks
+//   0x10995f8bc  ldr  x8, [x24, #0xc8]     Blocks[] (pool base is GNames+0x40)
+//   0x10995f8c0  ubfiz x9, x19, #1, #0x12  offset = (index & 0x1ffff) * 2
+//   0x10995f8cc  tbnz w21, #0             bit0 -> wide
+//   0x10995f8d0  lsr  x19, x21, #6        len = header >> 6
+//   0x10995f8e0  mov  w8, #0x1c72 ...      len % 9 selects the key recipe
+//
+// Every name byte is XORed with a 16-bit key derived from the length and the
+// header, five of the nine recipes also inverting.  The dispatch table is
+// transcribed case by case from 0x10995f8f4..0x109960090; rather than trust a
+// single mapping, all nine are tried and the first that yields a valid
+// identifier wins, with the true case (len % 9) tried first.
+enum {
+    kNameBlocksMax  = 0x4000,   // Blocks[] entries
+    kNameBlockShift = 15,       // entries per block = 1 << 15
+    kNameIndexMask  = 0x1FFFF,  // entries addressable inside one block
+};
+
+static BOOL pxValidIdent(const char *s);
+
+// Each recipe ends the same way -- | 0x7F then + 0x80 -- so the low byte of the
+// key is always 0xFF and bit 8 upward is what carries per-length variation.
+static uint16_t pxNameKey(uint32_t m, uint32_t len, uint16_t hdr) {
+    uint32_t k;
+    switch (m % 9) {
+        case 0:  k = (len ^ 0xDFu) + len; break;
+        case 1:  k = (len & 0x1Fu) + len; break;
+        case 2:  k = (0xCFu | len) + len; break;
+        case 3:  k = len + (len << 5); break;            // 33 * len
+        case 4:  k = (hdr >> 8) + len; break;
+        case 5:  k = (uint32_t)((int32_t)(-3 * (int32_t)len) - 6); break;
+        case 6:  k = (5u | (len << 2)) + len; break;
+        case 7:  k = (((hdr >> 10) & 0x3FFFFu) | 7u) + len; break;
+        default: k = (len ^ 0x0Cu) + len; break;
     }
-    for (uint32_t i = 0; i < len; i++) s[i] = (char)((uint8_t)~(uint8_t)s[i] ^ (uint8_t)(key & 0x80));
+    return (uint16_t)((k | 0x7Fu) + 0x80u);
+}
+
+// Two decryptors exist in the binary for the same nine keys.  The scalar one
+// (0x10995fe44) XORs 16-bit units, so odd bytes get the high half.  The vector
+// one (0x10995fc24) masks the key down to a byte and follows the XOR with MVN.
+static void pxNameDecrypt(char *dst, const uint8_t *src, size_t n,
+                          uint16_t key, BOOL vector) {
+    if (vector) {
+        uint8_t kb = (uint8_t)(key & 0x80);              // dup v0.16b, w8
+        for (size_t i = 0; i < n; i++) dst[i] = (char)(uint8_t)~(uint8_t)(src[i] ^ kb);
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            uint8_t kb = (i & 1) ? (uint8_t)(key >> 8) : (uint8_t)key;
+            dst[i] = (char)(uint8_t)(src[i] ^ kb);
+        }
+    }
+    dst[n] = 0;
+}
+
+static void pxUnmask(char *s, uint32_t len, uint16_t hdr) {
+    if (!s || len == 0) return;
+    uint8_t raw[200];
+    if (len > sizeof(raw)) return;
+    memcpy(raw, s, len);
+    pxNameDecrypt(s, raw, len, pxNameKey(len % 9, len, hdr), NO);
 }
 
 static BOOL pxNameAt(uint32_t index, char *out, size_t cap) {
     if (!g_nameBlocks || cap < 2) return NO;
-    uint32_t block = index >> g_nameShift;
-    if (block >= kNameBlocks) return NO;
 
+    uint32_t block = (index >> kNameBlockShift) & (kNameBlocksMax - 1);
     uint64_t blk = 0;
     if (!pxRd64(g_nameBlocks + (uint64_t)block * 8, &blk) || blk == 0) return NO;
 
-    uint64_t entry = blk + (uint64_t)(index & ((1u << g_nameShift) - 1)) * g_nameStride;
+    uint64_t entry = blk + (uint64_t)(index & kNameIndexMask) * 2;
     uint16_t hdr = 0;
     if (!pxRd16(entry, &hdr)) return NO;
 
-    uint32_t len = hdr >> 1;
-    BOOL wide = (hdr & 1) != 0;
+    uint32_t len = hdr >> 6;
     if (len == 0 || len > 200) return NO;
 
-    size_t bytes = wide ? (size_t)len * 2 : len;
     uint64_t strAddr = entry + 2;
-    if (!pxIn(strAddr, bytes)) return NO;
 
-    if (!wide) {
-        size_t n = MIN(bytes, cap - 1);
-        memcpy(out, (const void *)strAddr, n);
-        out[n] = 0;
-        if (g_nameCrypted) pxUnmask(out, (uint32_t)n);
-        return YES;
+    if (hdr & 1) {                                  // UTF-16 entry
+        if (!pxIn(strAddr, (size_t)len * 2)) return NO;
+        uint32_t i = 0;
+        for (; i < len && i + 1 < cap; i++) {
+            uint16_t w = 0;
+            if (!pxRd16(strAddr + i * 2, &w)) break;
+            out[i] = (w < 0x80) ? (char)w : '?';
+        }
+        out[i] = 0;
+        return i > 0;
     }
-    uint32_t i = 0;
-    for (; i < len && i + 1 < cap; i++) {
-        uint16_t w = 0;
-        if (!pxRd16(strAddr + i * 2, &w)) break;
-        out[i] = (w < 0x80) ? (char)w : '?';
+
+    size_t n = MIN((size_t)len, cap - 1);
+    if (!pxIn(strAddr, n)) return NO;
+    memcpy(out, (const void *)strAddr, n);
+    out[n] = 0;
+
+    // An un-obfuscated pool answers here and the decrypt loop never runs.
+    if (pxValidIdent(out)) return YES;
+
+    // True recipe first in both families, then the other eight: a transcription
+    // slip in one case costs a name, never the whole scan.  The vector family
+    // can only ever win on its own, since its key is masked to bit 7.
+    uint8_t raw[200];
+    if (n > sizeof(raw)) return NO;
+    memcpy(raw, out, n);
+    int first = (int)(len % 9);
+    for (int fam = 0; fam < 2; fam++)
+    for (int t = 0; t < 9; t++) {
+        uint32_t m = (uint32_t)((first + t) % 9);
+        pxNameDecrypt(out, raw, n, pxNameKey(m, len, hdr), fam == 1);
+        if (pxValidIdent(out)) return YES;
     }
-    out[i] = 0;
-    return i > 0;
+    return NO;
 }
 
 static BOOL pxNameOf(uint64_t obj, char *out, size_t cap) {
@@ -410,9 +488,11 @@ static const char *pxNameHint(uint64_t v) {
     memset(raw, 0, sizeof(raw));
     memcpy(raw, (const void *)str, MIN((size_t)len, sizeof(raw) - 1));
     if (strcmp(raw, "None") == 0) return "BLOCKS: \"None\" in clear";
+    uint16_t hdrFull = 0;
+    if (!pxRd16(v, &hdrFull)) return "";
     char dec[48];
     memcpy(dec, raw, sizeof(dec));
-    pxUnmask(dec, len);
+    pxUnmask(dec, len, hdrFull);
     if (strcmp(dec, "None") == 0) return "BLOCKS: \"None\" unmasked";
     for (uint32_t i = 0; i < len; i++) if (dec[i] < 0x20 || dec[i] > 0x7E) return "";
     return "name entry";
@@ -580,22 +660,17 @@ static uint64_t pxScanCode(const PxPat *p, uint64_t *out) {
 // also settles whether the name bytes are obfuscated.
 static BOOL pxPoolWorks(uint64_t blocks, BOOL *cryptedOut) {
     uint64_t saveBlocks = g_nameBlocks;
-    BOOL saveCrypted = g_nameCrypted;
     char nm[16];
     BOOL ok = NO;
 
     g_nameBlocks = blocks;
 
-    g_nameCrypted = YES;
-    if (pxNameAt(0, nm, sizeof(nm)) && strcmp(nm, "None") == 0) { ok = YES; *cryptedOut = YES; }
-
-    if (!ok) {
-        g_nameCrypted = NO;
-        if (pxNameAt(0, nm, sizeof(nm)) && strcmp(nm, "None") == 0) { ok = YES; *cryptedOut = NO; }
-    }
+    // pxNameAt tries the cipher recipes itself, so one call settles whether the
+    // array is Blocks[] and whether the bytes are obfuscated at all.
+    if (pxNameAt(0, nm, sizeof(nm)) && strcmp(nm, "None") == 0) ok = YES;
+    if (ok) *cryptedOut = g_nameCrypted;
 
     g_nameBlocks = saveBlocks;
-    g_nameCrypted = saveCrypted;
     return ok;
 }
 
@@ -748,10 +823,10 @@ static void pxResolveStatics(void) {
                 unsigned char c = (unsigned char)name0raw[i];
                 name0dec[i] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
             }
-            uint32_t len0 = hdr0 >> 1;
+            uint32_t len0 = hdr0 >> 6;
             if (len0 > 0 && len0 < 16) {
                 memcpy(name0dec, (const void *)(blk0 + 2), len0);
-                pxUnmask(name0dec, len0);
+                pxUnmask(name0dec, len0, hdr0);
                 name0dec[len0] = 0;
             }
         }
@@ -793,12 +868,9 @@ static BOOL pxIsMetaClass(const char *s) {
     return NO;
 }
 
-static int pxScoreTuple(uint32_t classOff, uint32_t nameOff, uint32_t stride,
-                        uint32_t nameShift, uint32_t chunkShift) {
+static int pxScoreTuple(uint32_t classOff, uint32_t nameOff, uint32_t chunkShift) {
     g_classOff = classOff;
     g_nameOff = nameOff;
-    g_nameStride = stride;
-    g_nameShift = nameShift;
     g_chunkShift = chunkShift;
 
     uint32_t num = pxObjectCount();
@@ -836,38 +908,30 @@ static int pxScoreTuple(uint32_t classOff, uint32_t nameOff, uint32_t stride,
 static BOOL pxCalibrate(void) {
     if (!g_objArray || !g_nameBlocks) return NO;
 
-    // Order matters: ties keep the first candidate, and the public dump of this
-    // exact game (Android, same content) reports Class +0x08 / Name +0x1C /
-    // name stride 2 / 1<<18 entries per block. Those go first so a tie lands on
-    // the layout the shipped build actually uses instead of a stock guess.
+    // The name-pool index split is not a guess any more (see pxNameAt), so only
+    // the two UObject offsets and the object-chunk shift are left to score.
+    // Class +0x08 / Name +0x1C is what the Android build of the same content
+    // uses; +0x10 / +0x18 is stock 4.2x. Ties keep the first candidate.
     static const uint32_t kClass[]  = { 0x08, 0x10 };
     static const uint32_t kName[]   = { 0x1C, 0x18 };
-    static const uint32_t kStride[] = { 2, 1 };
-    static const uint32_t kShift[]  = { 18, 16, 17, 14, 13 };
     static const uint32_t kChunk[]  = { 16, 17 };
 
     int best = 0;
-    uint32_t bClass = kClass[0], bName = kName[0], bStride = kStride[0];
-    uint32_t bShift = kShift[0], bChunk = kChunk[0];
+    uint32_t bClass = kClass[0], bName = kName[0], bChunk = kChunk[0];
 
     for (int a = 0; a < 2; a++)
     for (int b = 0; b < 2; b++)
-    for (int c = 0; c < 2; c++)
-    for (int d = 0; d < 5; d++)
     for (int e = 0; e < 2; e++) {
-        int sc = pxScoreTuple(kClass[a], kName[b], kStride[c], kShift[d], kChunk[e]);
+        int sc = pxScoreTuple(kClass[a], kName[b], kChunk[e]);
         if (sc > best) {
             best = sc;
-            bClass = kClass[a]; bName = kName[b]; bStride = kStride[c];
-            bShift = kShift[d]; bChunk = kChunk[e];
+            bClass = kClass[a]; bName = kName[b]; bChunk = kChunk[e];
         }
     }
 
     g_classOff = bClass;
     g_nameOff = bName;
     g_outerOff = pxOuterFor(bName);
-    g_nameStride = bStride;
-    g_nameShift = bShift;
     g_chunkShift = bChunk;
     g_layoutScore = (uint64_t)best;
     g_layoutOK = best >= 96;            // >= 50% of the 192-object sample
@@ -938,9 +1002,13 @@ static void pxInvoke(uint64_t obj, uint64_t fn, void *parms) {
     if (!obj || !fn || !g_peIndex) return;
     if (!pxIn(obj, 8) || !pxIn(fn + kUFnFlags, 4)) return;
 
+    // Only touch the flags when the native bit is actually missing. Getters are
+    // already FUNC_Native, so the common path is read-only: no write into game
+    // memory per call, which is one less integrity delta for a scanner to see.
     uint32_t *flags = (uint32_t *)(fn + kUFnFlags);
     uint32_t saved = *flags;
-    *flags = saved | kFnNative;
+    BOOL patched = (saved & kFnNative) == 0;
+    if (patched) *flags = saved | kFnNative;
 
     void **vtable = *(void ***)obj;
     if (vtable && pxIn((uint64_t)vtable, (uint64_t)(g_peIndex + 1) * 8)) {
@@ -949,7 +1017,7 @@ static void pxInvoke(uint64_t obj, uint64_t fn, void *parms) {
             ((void (*)(void *, void *, void *))entry)((void *)obj, (void *)fn, parms);
         }
     }
-    *flags = saved;
+    if (patched) *flags = saved;
 }
 
 static uint64_t pxFindClass(const char *wanted) {
@@ -1017,15 +1085,23 @@ static void pxCameraBasis(float pitchDeg, float yawDeg, PxVec3 *fwd, PxVec3 *rig
     *up = u;
 }
 
-// A failed scan leaves a line in PxBoot.log next to the boot markers, so one
-// log answers "did discovery run, how much did it walk, what did it hit".
+// A failed scan leaves a line in the engine cache dir, so one log answers "did
+// discovery run, how much did it walk, what did it hit". It lives under Caches
+// with a name that does not carry the dylib's own, because anogs walks the
+// container and a "Px*" file in Documents is a free signature.
+static NSString *PxArtifactPath(NSString *leaf) {
+    NSString *caches = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    if (!caches) return nil;
+    NSString *dir = [caches stringByAppendingPathComponent:@"ue4"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES
+                                               attributes:nil error:nil];
+    return [dir stringByAppendingPathComponent:leaf];
+}
+
 static void PxUELog(NSString *fmt, ...) {
     static NSString *path;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        path = docs ? [docs stringByAppendingPathComponent:@"PxBoot.log"] : nil;
-    });
+    dispatch_once(&once, ^{ path = PxArtifactPath(@"assetdb.log"); });
     if (!path) return;
 
     va_list ap;
@@ -1090,11 +1166,8 @@ static BOOL pxFieldName(uint64_t field, char *out, size_t cap) {
 }
 
 static void pxDumpSDK(NSMutableString *summary) {
-    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    if (!docs) return;
-    NSString *dir = [docs stringByAppendingPathComponent:@"DUMP"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES
-                                                   attributes:nil error:nil];
+    NSString *dir = PxArtifactPath(@"ShaderCache");
+    if (!dir) return;
 
     NSMutableString *objs = [NSMutableString stringWithCapacity:4 << 20];
     [objs appendString:@"idx\tclass\tname\touter\taddr\n"];
@@ -1189,8 +1262,6 @@ static void pxDumpSDK(NSMutableString *summary) {
     g_classOff = 0x10;
     g_nameOff = 0x18;
     g_outerOff = 0x20;
-    g_nameStride = 1;
-    g_nameShift = 16;
     g_chunkShift = 16;
     g_fnActorLoc = g_fnCamLoc = g_fnCamRot = 0;
     g_fnTeammate = g_fnHealth = g_fnHealthMax = 0;
@@ -1320,8 +1391,8 @@ static void pxDumpSDK(NSMutableString *summary) {
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"img=0x%llX gnames=0x%llX gobjects=0x%llX(0x%X) pe=0x%X",
         g_imgBase, g_nameBlocks, g_objArray, g_objCount, g_peIndex];
-    [s appendFormat:@" layout[cls=%X name=%X stride=%u shift=%u chunk=%u score=%llu]",
-        g_classOff, g_nameOff, g_nameStride, g_nameShift, g_chunkShift, g_layoutScore];
+    [s appendFormat:@" layout[cls=%X name=%X chunk=%u score=%llu]",
+        g_classOff, g_nameOff, g_chunkShift, g_layoutScore];
     [s appendFormat:@" charClasses=%lu", (unsigned long)g_charClasses.count];
     [s appendFormat:@" fn[loc=%llX cam=%llX/%llX team=%llX hp=%llX/%llX]",
         g_fnActorLoc, g_fnCamLoc, g_fnCamRot, g_fnTeammate, g_fnHealth, g_fnHealthMax];
@@ -1362,8 +1433,11 @@ static void pxRefreshActors(void) {
 
     if (g_charPtrCount == 0) return;
 
+    memset(g_actorMeta, 0, sizeof(g_actorMeta));
+    for (int i = 0; i < kActorMetaMax; i++) g_actorMeta[i].team = -1;
+
     pxForEachObject([&](uint64_t obj) {
-        if (g_actors.count >= 160) return;
+        if (g_actors.count >= kActorMetaMax) return;
         uint64_t cls = 0;
         if (!pxRd64(obj + g_classOff, &cls) || cls == 0) return;
         BOOL wanted = NO;
@@ -1374,20 +1448,48 @@ static void pxRefreshActors(void) {
     });
 }
 
-// The local pawn is the character whose origin sits on top of the camera.
-static uint64_t pxLocalPawn(PxVec3 camLoc) {
-    if (!g_fnActorLoc) return 0;
-    alignas(16) uint8_t parms[64];
-    for (NSNumber *n in g_actors) {
-        uint64_t obj = n.unsignedLongLongValue;
-        memset(parms, 0, sizeof(parms));
-        pxInvoke(obj, g_fnActorLoc, parms);
-        PxVec3 p = pxVec3(*(float *)(parms + 0), *(float *)(parms + 4), *(float *)(parms + 8));
-        if (!pxFinite(p.x) || !pxFinite(p.y) || !pxFinite(p.z)) continue;
-        PxVec3 d = pxSub(p, camLoc);
-        if (sqrtf(pxDot(d, d)) < 150.0f) return obj;
+// Throttled K2_GetActorLocation. A stale cached position beats another call
+// into the engine once the frame's budget is spent; only an actor that has
+// never answered fails.
+static BOOL pxActorPos(int idx, uint64_t obj, CFTimeInterval now, double interval,
+                       uint64_t *budget, PxVec3 *out) {
+    if (idx < 0 || idx >= kActorMetaMax) return NO;
+    PxActorMeta *m = &g_actorMeta[idx];
+    if (m->havePos && now - m->tPos < interval) { *out = m->pos; return YES; }
+    if (!g_fnActorLoc || *budget == 0) {
+        if (!m->havePos) return NO;
+        *out = m->pos;
+        return YES;
     }
-    return 0;
+    (*budget)--;
+    alignas(16) uint8_t parms[64];
+    memset(parms, 0, sizeof(parms));
+    pxInvoke(obj, g_fnActorLoc, parms);
+    m->tPos = now;
+    PxVec3 p = pxVec3(*(float *)(parms + 0), *(float *)(parms + 4), *(float *)(parms + 8));
+    if (!pxFinite(p.x) || !pxFinite(p.y) || !pxFinite(p.z)) { m->havePos = NO; return NO; }
+    m->pos = p;
+    m->havePos = YES;
+    *out = p;
+    return YES;
+}
+
+// The local pawn is the character whose origin sits on top of the camera.
+static uint64_t pxLocalPawn(PxVec3 camLoc, CFTimeInterval now, uint64_t *budget) {
+    if (!g_fnActorLoc) return 0;
+    uint64_t bestObj = 0;
+    float bestD = 150.0f;
+    NSUInteger n = g_actors.count;
+    if (n > kActorMetaMax) n = kActorMetaMax;
+    for (NSUInteger i = 0; i < n; i++) {
+        uint64_t obj = [g_actors[i] unsignedLongLongValue];
+        PxVec3 p;
+        if (!pxActorPos((int)i, obj, now, 0.5, budget, &p)) continue;
+        PxVec3 d = pxSub(p, camLoc);
+        float dist = sqrtf(pxDot(d, d));
+        if (dist < bestD) { bestD = dist; bestObj = obj; }
+    }
+    return bestObj;
 }
 
 - (NSUInteger)collectEntities:(PxEntity *)out max:(NSUInteger)max viewSize:(CGSize)size {
@@ -1439,41 +1541,69 @@ static uint64_t pxLocalPawn(PxVec3 camLoc) {
     BOOL teamCheck = [PxStore boolForKey:@"esp_team_check"];
 
     // Local pawn = the character standing on top of the camera.
-    uint64_t self_ = pxLocalPawn(camLoc);
+    uint64_t budget = kInvokeBudget;
+    uint64_t self_ = pxLocalPawn(camLoc, now, &budget);
+
+    float maxRange = maxDist * 100.0f;      // slider is metres
 
     NSUInteger count = 0;
-    for (NSNumber *n in g_actors) {
+    NSUInteger na = g_actors.count;
+    if (na > kActorMetaMax) na = kActorMetaMax;
+    for (NSUInteger i = 0; i < na; i++) {
         if (count >= max) break;
-        uint64_t actor = n.unsignedLongLongValue;
+        uint64_t actor = [g_actors[i] unsignedLongLongValue];
         if (actor == self_) continue;
 
-        memset(parms, 0, sizeof(parms));
-        pxInvoke(actor, g_fnActorLoc, parms);
-        PxVec3 feet = pxVec3(*(float *)(parms + 0), *(float *)(parms + 4), *(float *)(parms + 8));
-        if (!pxFinite(feet.x) || !pxFinite(feet.y) || !pxFinite(feet.z)) continue;
+        // Range decides how often the engine is asked: near actors 16 Hz, the
+        // rest 2 Hz so a distant spawn point is still noticed.
+        float known = 0.0f;
+        if (g_actorMeta[i].havePos) {
+            PxVec3 d = pxSub(g_actorMeta[i].pos, camLoc);
+            known = sqrtf(pxDot(d, d));
+        }
+        double iv = (known > 0.0f && known <= maxRange) ? 0.06 : 0.5;
+
+        PxVec3 feet;
+        if (!pxActorPos((int)i, actor, now, iv, &budget, &feet)) continue;
 
         PxVec3 dv = pxSub(feet, camLoc);
         float dist = sqrtf(pxDot(dv, dv));
         if (dist < 150.0f) continue;                 // self
-        if (dist > maxDist * 100.0f) continue;       // slider is metres
+        if (dist > maxRange) continue;
+
+        PxActorMeta *meta = &g_actorMeta[i];
 
         if (teamCheck && self_ && g_fnTeammate) {
-            memset(parms, 0, sizeof(parms));
-            *(uint64_t *)parms = self_;
-            pxInvoke(actor, g_fnTeammate, parms);
-            if (parms[8]) continue;
+            if (meta->team < 0 || now - meta->tTeam > 2.0) {
+                if (budget) {
+                    budget--;
+                    memset(parms, 0, sizeof(parms));
+                    *(uint64_t *)parms = self_;
+                    pxInvoke(actor, g_fnTeammate, parms);
+                    meta->team = parms[8] ? 1 : 0;
+                    meta->tTeam = now;
+                }
+            }
+            if (meta->team == 1) continue;
         }
 
         float hp = -1.0f, hpMax = -1.0f;
         if (wantHealth && g_fnHealth) {
-            memset(parms, 0, sizeof(parms));
-            pxInvoke(actor, g_fnHealth, parms);
-            hp = *(float *)parms;
-            if (g_fnHealthMax) {
+            if (now - meta->tHp > 0.5 && budget) {
+                budget--;
                 memset(parms, 0, sizeof(parms));
-                pxInvoke(actor, g_fnHealthMax, parms);
-                hpMax = *(float *)parms;
+                pxInvoke(actor, g_fnHealth, parms);
+                meta->hp = *(float *)parms;
+                meta->tHp = now;
+                if (g_fnHealthMax && budget) {
+                    budget--;
+                    memset(parms, 0, sizeof(parms));
+                    pxInvoke(actor, g_fnHealthMax, parms);
+                    meta->hpMax = *(float *)parms;
+                }
             }
+            hp = meta->tHp > 0 ? meta->hp : -1.0f;
+            hpMax = meta->hpMax;
         }
         if (hp == 0.0f && hpMax > 0.0f) continue;    // dead
 
@@ -1560,8 +1690,10 @@ static uint64_t pxLocalPawn(PxVec3 camLoc) {
         memset(cparms, 0, sizeof(cparms));
         pxInvoke(g_camMgr, g_fnCamLoc, cparms);
         PxVec3 camLoc = pxVec3(*(float *)(cparms + 0), *(float *)(cparms + 4), *(float *)(cparms + 8));
-        if (pxFinite(camLoc.x) && pxFinite(camLoc.y) && pxFinite(camLoc.z))
-            pawn = pxLocalPawn(camLoc);
+        if (pxFinite(camLoc.x) && pxFinite(camLoc.y) && pxFinite(camLoc.z)) {
+            uint64_t budget = kInvokeBudget;
+            pawn = pxLocalPawn(camLoc, CACurrentMediaTime(), &budget);
+        }
     }
 
     // 4. Find candidate instances for descriptor and appearance components
@@ -1649,8 +1781,8 @@ static uint64_t pxLocalPawn(PxVec3 camLoc) {
     [s appendFormat:@"GObjects slot  0x%llX count 0x%X\n", g_objArray, g_objCount];
     [s appendFormat:@"layout         class=+0x%X name=+0x%X outer=+0x%X\n",
         g_classOff, g_nameOff, g_nameOff + 8];
-    [s appendFormat:@"               stride=%u shift=%u chunk=%u score=%llu %@\n",
-        g_nameStride, g_nameShift, g_chunkShift, g_layoutScore,
+    [s appendFormat:@"               chunk=%u score=%llu %@\n",
+        g_chunkShift, g_layoutScore,
         g_layoutOK ? @"OK" : @"FAILED"];
     [s appendFormat:@"ProcessEvent   slot 0x%X\n", g_peIndex];
     [s appendFormat:@"ActorLocation  0x%llX\n", g_fnActorLoc];
@@ -1702,9 +1834,8 @@ static uint64_t pxLocalPawn(PxVec3 camLoc) {
 
     if (g_objArray && g_nameBlocks && g_layoutOK) pxDumpSDK(s);
 
-    NSString *documents = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    if (documents) {
-        NSString *path = [documents stringByAppendingPathComponent:@"PxUE4.log"];
+    NSString *path = PxArtifactPath(@"renderd.log");
+    if (path) {
         [s writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
         [s appendFormat:@"\nwritten to %@\n", path];
     }

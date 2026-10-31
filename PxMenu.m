@@ -24,16 +24,24 @@ static NSInteger const kPxMaxInstallAttempts = 120;   // 120 * 0.25s = 30s
 // then and the kill came from outside.
 static const double kPxInstallDelay = 5.0;
 
-// Documents/PxBoot.log survives a SIGKILL, so it is the only way to tell "our
+// Caches/ue4/assetdb.log survives a SIGKILL, so it is the only way to tell "our
 // code threw" apart from "the anti-cheat killed the process". Every step writes
-// before it runs; the last line in the file is where it died.
+// before it runs; the last line in the file is where it died. It shares the path
+// with PxUE4's logger and stays out of Documents: a container-visible file named
+// after the dylib is a signature anogs does not have to work for.
+static NSString *PxLogPath(void) {
+    NSString *caches = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    if (!caches) return nil;
+    NSString *dir = [caches stringByAppendingPathComponent:@"ue4"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES
+                                               attributes:nil error:nil];
+    return [dir stringByAppendingPathComponent:@"assetdb.log"];
+}
+
 static void PxLog(NSString *fmt, ...) {
     static NSString *path;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        path = docs ? [docs stringByAppendingPathComponent:@"PxBoot.log"] : nil;
-    });
+    dispatch_once(&once, ^{ path = PxLogPath(); });
     if (!path) return;
 
     va_list ap;
@@ -69,8 +77,8 @@ static NSString *PxMarkerPath(void) {
     static NSString *path;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        path = docs ? [docs stringByAppendingPathComponent:@"PxBoot.inprogress"] : nil;
+        NSString *caches = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+        path = caches ? [caches stringByAppendingPathComponent:@"ue4/assetdb.tmp"] : nil;
     });
     return path;
 }

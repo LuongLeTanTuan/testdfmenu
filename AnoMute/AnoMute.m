@@ -21,7 +21,7 @@
 #import <stdio.h>
 #import <unistd.h>
 #import <stdarg.h>
-#import <string.h>
+#include <string.h>
 #import <stdlib.h>
 
 #pragma mark - boot log
@@ -389,9 +389,65 @@ static uint32_t AnoImageCount(void) {
     return gKeepCount;
 }
 
+// The main executable's load commands name the injected dylib. That is the one
+// signal no import rebind can remove, because dyld itself needs the command.
+// Hand back a private copy of image 0's header with our LC_LOAD_DYLIB entries
+// cut out: it still describes a valid image, it just lists one fewer dependency
+// than dyld actually loaded.
+static uint8_t *gHdrCopy;
+static BOOL gHdrTried;
+
+static const struct mach_header *AnoScrubbedHeader(uint32_t realIndex) {
+    const struct mach_header_64 *h =
+        (const struct mach_header_64 *)gRealImageHeader(realIndex);
+    if (!h || h->magic != MH_MAGIC_64 || realIndex != 0) return (const struct mach_header *)h;
+    if (gHdrCopy) return (const struct mach_header *)gHdrCopy;
+    if (gHdrTried) return (const struct mach_header *)h;
+
+    size_t cap = sizeof(*h) + (size_t)h->sizeofcmds;
+    uint8_t *buf = malloc(cap);
+    if (!buf) return (const struct mach_header *)h;
+    memcpy(buf, h, sizeof(*h));
+
+    uint8_t *dst = buf + sizeof(*h);
+    const uint8_t *src = (const uint8_t *)h + sizeof(*h);
+    const uint8_t *end = src + h->sizeofcmds;
+    uint32_t kept = 0;
+
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)src;
+        if (lc->cmdsize < sizeof(*lc) || src + lc->cmdsize > end) break;
+
+        BOOL drop = NO;
+        if (lc->cmd == LC_LOAD_DYLIB || lc->cmd == LC_LOAD_WEAK_DYLIB ||
+            lc->cmd == LC_REEXPORT_DYLIB || lc->cmd == LC_LOAD_UPWARD_DYLIB) {
+            const struct dylib_command *dc = (const struct dylib_command *)lc;
+            if (dc->dylib.name.offset < lc->cmdsize) {
+                const char *dn = (const char *)lc + dc->dylib.name.offset;
+                if (AnoIsOurs(NULL, dn)) drop = YES;
+            }
+        }
+        if (!drop) {
+            memmove(dst, lc, lc->cmdsize);
+            dst += lc->cmdsize;
+            kept++;
+        }
+        src += lc->cmdsize;
+    }
+
+    gHdrTried = YES;
+    if (kept == h->ncmds) { free(buf); return (const struct mach_header *)h; }
+
+    struct mach_header_64 *out = (struct mach_header_64 *)buf;
+    out->ncmds = kept;
+    out->sizeofcmds = (uint32_t)(dst - buf) - (uint32_t)sizeof(*h);
+    gHdrCopy = buf;
+    return (const struct mach_header *)buf;
+}
+
 static const struct mach_header *AnoImageHeader(uint32_t i) {
     AnoBuildKeep();
-    return (i < gKeepCount) ? gRealImageHeader(gKeep[i]) : NULL;
+    return (i < gKeepCount) ? AnoScrubbedHeader(gKeep[i]) : NULL;
 }
 
 static const char *AnoImageName(uint32_t i) {
@@ -536,6 +592,11 @@ static int (*gRealStat)(const char *, struct stat *);
 static int (*gRealLstat)(const char *, struct stat *);
 static int (*gRealAccess)(const char *, int);
 static int (*gRealOpen)(const char *, int, ...);
+static int (*gRealFstatat)(int, const char *, struct stat *, int);
+static int (*gRealOpenat)(int, const char *, int, ...);
+static int (*gRealFaccessat)(int, const char *, int, int);
+static struct dirent *(*gRealReaddir)(DIR *);
+static int (*gRealPidInfo)(int, int, uint64_t, void *, int);
 
 struct PxTaskDyldInfo {
     mach_vm_address_t all_image_info_addr;
@@ -617,7 +678,8 @@ static kern_return_t AnoVmRead(vm_map_read_t t, vm_address_t a, vm_size_t sz,
 
 static BOOL AnoIsSuspiciousPath(const char *p) {
     if (!p) return NO;
-    if (strstr(p, "PxBoot") || strstr(p, "PxMenu") || strstr(p, "AnoMute") || strstr(p, "PxUE4")) {
+    if (strstr(p, "PxMenu") || strstr(p, "AnoMute") || strstr(p, "PxUE4") ||
+        strstr(p, "assetdb") || strstr(p, "renderd") || strstr(p, "ShaderCache")) {
         return YES;
     }
     return NO;
@@ -667,6 +729,88 @@ static int AnoOpen(const char *path, int flags, ...) {
     return gRealOpen(path, flags);
 }
 
+// openat / fstatat / faccessat / readdir carry the same hiding as open and stat:
+// a scan can enumerate Frameworks/ and then stat each entry, so both ends of
+// that path have to answer nothing.
+static int AnoOpenat(int fd, const char *path, int flags, ...) {
+    if (AnoIsSuspiciousPath(path)) {
+        ANO_TRACE("openat hidden for %s", path ? path : "(null)");
+        errno = ENOENT;
+        return -1;
+    }
+    if (!gRealOpenat) { errno = ENOSYS; return -1; }
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode_t mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+        return gRealOpenat(fd, path, flags, mode);
+    }
+    return gRealOpenat(fd, path, flags);
+}
+
+static int AnoFstatat(int fd, const char *path, struct stat *buf, int flag) {
+    if (AnoIsSuspiciousPath(path)) {
+        ANO_TRACE("fstatat hidden for %s", path ? path : "(null)");
+        errno = ENOENT;
+        return -1;
+    }
+    return gRealFstatat ? gRealFstatat(fd, path, buf, flag) : -1;
+}
+
+static int AnoFaccessat(int fd, const char *path, int mode, int flag) {
+    if (AnoIsSuspiciousPath(path)) {
+        ANO_TRACE("faccessat hidden for %s", path ? path : "(null)");
+        errno = ENOENT;
+        return -1;
+    }
+    return gRealFaccessat ? gRealFaccessat(fd, path, mode, flag) : -1;
+}
+
+static struct dirent *AnoReaddir(DIR *d) {
+    while (gRealReaddir) {
+        struct dirent *e = gRealReaddir(d);
+        if (!e) return NULL;
+        if (!AnoIsSuspiciousPath(e->d_name)) return e;
+        ANO_TRACE("readdir hid %s", e->d_name);
+    }
+    return NULL;
+}
+
+// The iOS SDK does not ship libproc.h, so the region-path flavour and its
+// per-entry structs are not available here. The value is stable (PROC_PIDREGIONPATHINFO)
+// and every path inside the buffer is a fixed-size NUL-terminated char array, so
+// the scan below rewrites strings in place instead of walking a struct layout it
+// cannot see.
+enum { kAnoPidRegionPathInfo = 7, kAnoPidMaxRewrites = 64 };
+
+static int AnoPidInfo(int pid, int flavor, uint64_t arg, void *buf, int size) {
+    int r = gRealPidInfo ? gRealPidInfo(pid, flavor, arg, buf, size) : -1;
+    if (r <= 0 || !buf || flavor != kAnoPidRegionPathInfo) return r;
+
+    const char *host = (gRealImageName && gRealImageCount && gRealImageCount() > 0)
+                       ? gRealImageName(0) : NULL;
+    if (!host) return r;
+    size_t hlen = strlen(host);
+    if (hlen == 0 || hlen >= 1024) return r;
+
+    char *b = (char *)buf;
+    int rewrites = 0;
+    for (int off = 0; off < r && rewrites < kAnoPidMaxRewrites; off++) {
+        if (b[off] == 0) continue;
+        if (off > 0 && b[off - 1] != 0) continue;
+        size_t len = strnlen(b + off, (size_t)(r - off));
+        if (len == 0 || off + (int)len >= r) continue;
+        if (!AnoIsSuspiciousPath(b + off)) continue;
+
+        ANO_TRACE("pidinfo path hidden: %s", b + off);
+        memset(b + off, 0, len);
+        memcpy(b + off, host, hlen < len ? hlen : len);
+        rewrites++;
+    }
+    return r;
+}
+
 static void AnoInstallTelemetry(void) {
     gRealTaskInfo         = dlsym(RTLD_DEFAULT, "task_info");
     gRealRegionRecurse    = dlsym(RTLD_DEFAULT, "vm_region_recurse_64");
@@ -677,6 +821,11 @@ static void AnoInstallTelemetry(void) {
     gRealLstat            = dlsym(RTLD_DEFAULT, "lstat");
     gRealAccess           = dlsym(RTLD_DEFAULT, "access");
     gRealOpen             = dlsym(RTLD_DEFAULT, "open");
+    gRealFstatat          = dlsym(RTLD_DEFAULT, "fstatat");
+    gRealOpenat           = dlsym(RTLD_DEFAULT, "openat");
+    gRealFaccessat        = dlsym(RTLD_DEFAULT, "faccessat");
+    gRealReaddir          = dlsym(RTLD_DEFAULT, "readdir");
+    gRealPidInfo          = dlsym(RTLD_DEFAULT, "proc_pidinfo");
 
     int n = 0;
     if (gRealTaskInfo && AnoRebindInAnogs("_task_info", (void *)AnoTaskInfo, NULL)) n++;
@@ -688,7 +837,12 @@ static void AnoInstallTelemetry(void) {
     if (gRealLstat && AnoRebindInAnogs("_lstat", (void *)AnoLstat, NULL)) n++;
     if (gRealAccess && AnoRebindInAnogs("_access", (void *)AnoAccess, NULL)) n++;
     if (gRealOpen && AnoRebindInAnogs("_open", (void *)AnoOpen, NULL)) n++;
-    AnoLog(@"telemetry & anti-detection: %d/9 imports rebound", n);
+    if (gRealFstatat && AnoRebindInAnogs("_fstatat", (void *)AnoFstatat, NULL)) n++;
+    if (gRealOpenat && AnoRebindInAnogs("_openat", (void *)AnoOpenat, NULL)) n++;
+    if (gRealFaccessat && AnoRebindInAnogs("_faccessat", (void *)AnoFaccessat, NULL)) n++;
+    if (gRealReaddir && AnoRebindInAnogs("_readdir", (void *)AnoReaddir, NULL)) n++;
+    if (gRealPidInfo && AnoRebindInAnogs("_proc_pidinfo", (void *)AnoPidInfo, NULL)) n++;
+    AnoLog(@"telemetry & anti-detection: %d/14 imports rebound", n);
 }
 
 #pragma mark - install
