@@ -41,6 +41,15 @@ typedef struct {
 
 // One line into Documents/PxBoot.log from anywhere in the dylib, so the menu and
 // the injector leave a trail even when no UE4 state exists yet.
+// extern "C" is load-bearing: the definition lives in a .mm, and without it the
+// symbol is C++-mangled while every ObjC caller binds the plain name -- which is
+// an undefined symbol at load, i.e. a crash before the first log line.
+#ifdef __cplusplus
+extern "C" {
+#endif
 void PxLogShared(NSString *fmt, ...);
+#ifdef __cplusplus
+}
+#endif
 
 #endif
