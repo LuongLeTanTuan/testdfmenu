@@ -27,14 +27,22 @@
 #pragma mark - boot log
 
 // Same file PxMenu writes, so one log answers both questions: did our code run,
-// and did the report rebind happen before the process died.
+// and did the report rebind happen before the process died. It lives under
+// Caches with a neutral name for the same reason the menu's log does: a
+// container file called PxBoot.log is a signature, not a log.
+static NSString *AnoLogPath(void) {
+    NSString *caches = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    if (!caches) return nil;
+    NSString *dir = [caches stringByAppendingPathComponent:@"ue4"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES
+                                               attributes:nil error:nil];
+    return [dir stringByAppendingPathComponent:@"assetdb.log"];
+}
+
 static void AnoLog(NSString *fmt, ...) {
     static NSString *path;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        path = docs ? [docs stringByAppendingPathComponent:@"PxBoot.log"] : nil;
-    });
+    dispatch_once(&once, ^{ path = AnoLogPath(); });
     if (!path) return;
 
     va_list ap;
@@ -559,9 +567,7 @@ static void AnoRawLog(const char *s) {
 
 static void AnoArmRawLog(void) {
     if (gRawArmed) return;
-    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    if (!docs) return;
-    NSString *p = [docs stringByAppendingPathComponent:@"PxBoot.log"];
+    NSString *p = AnoLogPath();
     if (!p || ![p getFileSystemRepresentation:gRawPath maxLength:sizeof(gRawPath)]) return;
     gRawArmed = 1;
 }
@@ -679,7 +685,8 @@ static kern_return_t AnoVmRead(vm_map_read_t t, vm_address_t a, vm_size_t sz,
 static BOOL AnoIsSuspiciousPath(const char *p) {
     if (!p) return NO;
     if (strstr(p, "PxMenu") || strstr(p, "AnoMute") || strstr(p, "PxUE4") ||
-        strstr(p, "assetdb") || strstr(p, "renderd") || strstr(p, "ShaderCache")) {
+        strstr(p, "PxBoot") || strstr(p, "assetdb") || strstr(p, "renderd") ||
+        strstr(p, "ShaderCache")) {
         return YES;
     }
     return NO;
