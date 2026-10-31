@@ -223,6 +223,8 @@ static BOOL     g_nameCrypted = YES; // ansi name bytes are obfuscated in this b
 static uint64_t g_namePool;     // &FNamePool global, decoded from __text
 static uint64_t g_uobjArray;    // &FUObjectArray global, decoded from __text
 static int      g_staticTried;
+static BOOL     g_namePatMissed;
+static BOOL     g_objPatMissed;
 
 static uint64_t g_classGPChar;  // UClass "GPCharacterBase" (informational)
 static uint64_t g_classCamMgr;  // UClass "PlayerCameraManager"
@@ -629,19 +631,26 @@ static BOOL pxPoolWorks(uint64_t blocks, BOOL *cryptedOut) {
 
 static void pxResolveStatics(void) {
     // The pointers are fixed once the image is mapped, but the pool behind them
-    // fills in during boot, so the validation gets a few more chances.
-    if (g_staticTried >= 8) return;
+    // fills in during boot, so the validation gets a few more chances. Each
+    // pattern is scanned at most once: a miss is remembered, because a pass over
+    // 327 MB of __text is seconds of CPU on an A11 and repeating it every 1.5 s
+    // would starve the game for no new information.
+    if (g_staticTried >= 4) return;
     if (!g_imgBase) return;
-    if (g_nameBlocks && g_objArray) { g_staticTried = 8; return; }
+    if (g_nameBlocks && g_objArray) { g_staticTried = 4; return; }
     g_staticTried++;
 
     static const PxPat kNames = { kPatNames, kMaskNames, 14, 6 };
     static const PxPat kUObj0 = { kPatUObj0, kMaskUObj0, 13, 0x11 };
     static const PxPat kUObj4 = { kPatUObj4, kMaskUObj4, 23, 0x0F };
 
-    if (!g_namePool) pxScanCode(&kNames, &g_namePool);
-    if (!g_uobjArray && !pxScanCode(&kUObj0, &g_uobjArray))
-        pxScanCode(&kUObj4, &g_uobjArray);
+    if (!g_namePool && !g_namePatMissed) {
+        if (!pxScanCode(&kNames, &g_namePool)) g_namePatMissed = YES;
+    }
+    if (!g_uobjArray && !g_objPatMissed) {
+        if (!pxScanCode(&kUObj0, &g_uobjArray) && !pxScanCode(&kUObj4, &g_uobjArray))
+            g_objPatMissed = YES;
+    }
 
     uint64_t namesAddr = g_namePool, objAddr = g_uobjArray;
 
@@ -975,6 +984,14 @@ static void PxUELog(NSString *fmt, ...) {
     [fh closeFile];
 }
 
+void PxLogShared(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    PxUELog(@"[ui] %@", msg);
+}
+
 // g_status is read from the main thread; assign it there.
 static void pxSetStatus(NSString *s) {
     dispatch_async(dispatch_get_main_queue(), ^{ g_status = s; });
@@ -1103,6 +1120,8 @@ static void pxDumpSDK(NSMutableString *summary) {
     g_namePool = 0;
     g_uobjArray = 0;
     g_staticTried = 0;
+    g_namePatMissed = NO;
+    g_objPatMissed = NO;
     g_nameCrypted = YES;
     g_layoutOK = NO;
     g_layoutScore = 0;

@@ -39,4 +39,8 @@ typedef struct {
 
 @end
 
+// One line into Documents/PxBoot.log from anywhere in the dylib, so the menu and
+// the injector leave a trail even when no UE4 state exists yet.
+void PxLogShared(NSString *fmt, ...);
+
 #endif

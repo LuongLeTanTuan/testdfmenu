@@ -1,5 +1,6 @@
 #import "PxMenuView.h"
 #import "PxOverlay.h"
+#import "PxUE4.h"
 #import <objc/runtime.h>
 
 static const CGFloat kPxRowSwitch  = 44.0f;
@@ -31,6 +32,7 @@ static const void * const kPxControlKey = &kPxControlKey;
 @property (nonatomic, assign) NSInteger frameCount;
 @property (nonatomic, assign) CFTimeInterval lastFrameTime;
 @property (nonatomic, strong) UIWindow *hostWindow;
+@property (nonatomic, weak) UIWindow *prevKey;
 @end
 
 @implementation PxMenuView
@@ -514,29 +516,61 @@ static const void * const kPxControlKey = &kPxControlKey;
         window.backgroundColor = [UIColor clearColor];
         window.rootViewController = [[UIViewController alloc] init];
         window.rootViewController.view.backgroundColor = [UIColor clearColor];
-        // Same reason as PxOverlay: a window with no scene never attaches on
-        // iOS 13+, so the menu would be built, hidden = NO, and invisible.
-        if (@available(iOS 13.0, *)) {
-            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-                if ([s isKindOfClass:[UIWindowScene class]]) { window.windowScene = (UIWindowScene *)s; break; }
-            }
-        }
-        window.hidden = NO;
-        [window.rootViewController.view addSubview:self];
         self.hostWindow = window;
     }
-    self.hostWindow.hidden = NO;
+    // Same reason as PxOverlay: a window with no scene never attaches on
+    // iOS 13+, so the menu would be built, hidden = NO, and invisible. It is
+    // attached again here because hideMenu detaches it.
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]]) { self.hostWindow.windowScene = (UIWindowScene *)s; break; }
+        }
+    }
+
+    UIWindow *key = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.isKeyWindow) { key = w; break; }
+    }
+    if (key != self.hostWindow) self.prevKey = key;
+
+    UIView *host = self.hostWindow.rootViewController.view;
+    host.userInteractionEnabled = YES;
+    if (self.superview != host) [host addSubview:self];
+
     self.hidden = NO;
+    self.hostWindow.hidden = NO;
     [self relayout];
     [self startDisplayLink];
+
+    PxLogShared(@"menu shown, windows=%lu key=%@",
+                (unsigned long)[UIApplication sharedApplication].windows.count, self.prevKey);
 }
 
 - (void)hideMenu {
     self.hidden = YES;
     [self removeFromSuperview];
+
+    UIView *host = self.hostWindow.rootViewController.view;
+    host.userInteractionEnabled = NO;
     self.hostWindow.hidden = YES;
-    self.hostWindow = nil;
+    // Detach from the scene too. A merely hidden window still sits in the app's
+    // window list; anything that un-hides it later becomes a full-screen touch
+    // blocker with nothing drawn on it, which is the "nothing responds" report.
+    if (@available(iOS 13.0, *)) self.hostWindow.windowScene = nil;
+
+    UIWindow *prev = self.prevKey;
+    self.prevKey = nil;
+    // Hand key back to the host. A window that was never key still takes the
+    // touch layer while it is up, and the game does not always reclaim it.
+    if (prev && !prev.hidden) [prev makeKeyWindow];
+
     [self stopDisplayLink];
+
+    NSInteger visible = 0;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) if (!w.hidden) visible++;
+    PxLogShared(@"menu hidden, windows=%lu visible=%ld key=%@",
+                (unsigned long)[UIApplication sharedApplication].windows.count,
+                (long)visible, prev);
 }
 
 - (void)toggleMenu {

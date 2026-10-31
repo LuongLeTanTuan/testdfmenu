@@ -72,10 +72,12 @@ static NSString * const kPxButtonYKey = @"px_btn_y";
 }
 
 - (void)buttonTapped {
-    if (self.dragging) {
-        self.dragging = NO;
-        return;
-    }
+    // The drag flag used to be sticky: a pan that ended without TouchUpInside
+    // left it set and swallowed the next tap, so the menu could not be reopened.
+    // Read the live recogniser state instead.
+    UIGestureRecognizer *pan = self.button.gestureRecognizers.firstObject;
+    if (pan && (pan.state == UIGestureRecognizerStateBegan ||
+                pan.state == UIGestureRecognizerStateChanged)) return;
     [[PxMenuView shared] toggleMenu];
 }
 

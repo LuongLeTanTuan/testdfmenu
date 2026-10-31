@@ -41,7 +41,7 @@
                 if ([s isKindOfClass:[UIWindowScene class]]) { window.windowScene = (UIWindowScene *)s; break; }
             }
         }
-        window.hidden = NO;
+        window.hidden = YES;   // shown only while the ESP is actually enabled
         [window.rootViewController.view addSubview:overlay];
         overlay.window = window;
     }
@@ -61,6 +61,10 @@
         [self.link invalidate];
         self.link = nil;
     }
+    // A transparent full-screen window still sits in the app's window list and
+    // costs a hit-test pass on every touch; keep it out of the chain unless the
+    // ESP is on.
+    self.window.hidden = !enabled;
     [self setNeedsDisplay];
 }
 
