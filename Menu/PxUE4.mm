@@ -222,7 +222,7 @@ static uint32_t g_objCount;
 static BOOL     g_nameCrypted = YES; // ansi name bytes are obfuscated in this build
 static uint64_t g_namePool;     // &FNamePool global, decoded from __text
 static uint64_t g_uobjArray;    // &FUObjectArray global, decoded from __text
-static BOOL     g_staticTried;
+static int      g_staticTried;
 
 static uint64_t g_classGPChar;  // UClass "GPCharacterBase" (informational)
 static uint64_t g_classCamMgr;  // UClass "PlayerCameraManager"
@@ -1102,7 +1102,7 @@ static void pxDumpSDK(NSMutableString *summary) {
     g_objCount = 0;
     g_namePool = 0;
     g_uobjArray = 0;
-    g_staticTried = NO;
+    g_staticTried = 0;
     g_nameCrypted = YES;
     g_layoutOK = NO;
     g_layoutScore = 0;
