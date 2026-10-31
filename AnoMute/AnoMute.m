@@ -13,6 +13,9 @@
 #import <mach-o/nlist.h>
 #import <mach/mach.h>
 #import <mach/vm_region.h>
+#import <sys/stat.h>
+#import <dirent.h>
+#import <errno.h>
 #import <dlfcn.h>
 #import <fcntl.h>
 #import <stdio.h>
@@ -306,9 +309,10 @@ static void *AnoGetReport(void) {
     AnoDump("raw", p, n);
 
     if (!AnoLooksTextual(p, n)) {
-        AnoLog(@"binary report %zu B, passthrough", n);
-        NSLog(@"[AnoMute] binary report (%zu B) — passthrough", n);
-        return p;
+        static char kEmptyReport[4] = "";
+        AnoLog(@"binary report %zu B — MUTED to suppress ban report", n);
+        NSLog(@"[AnoMute] binary report (%zu B) — muted", n);
+        return kEmptyReport;
     }
 
     memcpy(gScrubBuf, p, n);
@@ -526,36 +530,73 @@ static kern_return_t (*gRealRegionRecurse)(vm_map_t, vm_address_t *, vm_size_t *
                                            mach_msg_type_number_t *);
 static int (*gRealSysctlByName)(const char *, void *, size_t *, void *, size_t);
 static void *(*gRealMemmem)(const void *, size_t, const void *, size_t);
-// Five arguments, not four. The old declaration dropped `size`, so every call
-// shifted one register and handed vm_read a pointer where a length belongs.
 static kern_return_t (*gRealVmRead)(vm_map_read_t, vm_address_t, vm_size_t,
                                     vm_offset_t *, mach_msg_type_number_t *);
+static int (*gRealStat)(const char *, struct stat *);
+static int (*gRealLstat)(const char *, struct stat *);
+static int (*gRealAccess)(const char *, int);
+static int (*gRealOpen)(const char *, int, ...);
+
+struct PxTaskDyldInfo {
+    mach_vm_address_t all_image_info_addr;
+    mach_vm_size_t    all_image_info_size;
+    integer_t         all_image_info_format;
+};
+
+struct PxDyldImageInfo {
+    const struct mach_header *imageLoadAddress;
+    const char               *imageFilePath;
+    uintptr_t                 imageFileModDate;
+};
+
+struct PxDyldAllImageInfos {
+    uint32_t                        version;
+    uint32_t                        infoArrayCount;
+    const struct PxDyldImageInfo   *infoArray;
+};
+
+static struct PxDyldAllImageInfos gShadowDyldAllInfo;
+static struct PxDyldImageInfo gShadowDyldImages[1024];
 
 static int AnoTaskInfo(task_t t, task_flavor_t f, task_info_t out, mach_msg_type_number_t *cnt) {
-    // TASK_DYLD_INFO (17) hands back dyld_all_image_infos, which is a second,
-    // independent image list that rebinding _dyld_* does not touch.
-    if (f == 17) ANO_TRACE("task_info(TASK_DYLD_INFO)");
-    return gRealTaskInfo ? gRealTaskInfo(t, f, out, cnt) : KERN_FAILURE;
+    int ret = gRealTaskInfo ? gRealTaskInfo(t, f, out, cnt) : KERN_FAILURE;
+    if (ret == KERN_SUCCESS && f == 17 && out) { // 17 == TASK_DYLD_INFO
+        struct PxTaskDyldInfo *ti = (struct PxTaskDyldInfo *)out;
+        if (ti->all_image_info_addr) {
+            struct PxDyldAllImageInfos *orig = (struct PxDyldAllImageInfos *)(uintptr_t)ti->all_image_info_addr;
+            if (orig->infoArray && orig->infoArrayCount > 0) {
+                uint32_t keep = 0;
+                uint32_t take = orig->infoArrayCount > 1024 ? 1024 : orig->infoArrayCount;
+                for (uint32_t i = 0; i < take; i++) {
+                    const struct PxDyldImageInfo *info = &orig->infoArray[i];
+                    if (AnoIsOurs(info->imageLoadAddress, info->imageFilePath)) continue;
+                    gShadowDyldImages[keep++] = *info;
+                }
+                gShadowDyldAllInfo = *orig;
+                gShadowDyldAllInfo.infoArray = gShadowDyldImages;
+                gShadowDyldAllInfo.infoArrayCount = keep;
+                ti->all_image_info_addr = (mach_vm_address_t)(uintptr_t)&gShadowDyldAllInfo;
+                ANO_TRACE("task_info(TASK_DYLD_INFO) masked %u -> %u images", take, keep);
+            }
+        }
+    }
+    return ret;
 }
 
 static kern_return_t AnoRegionRecurse(vm_map_t m, vm_address_t *a, vm_size_t *s, natural_t *d,
                                       vm_region_recurse_info_t i, mach_msg_type_number_t *c) {
-    ANO_TRACE("vm_region_recurse_64 at=0x%llX depth=%u",
-              (unsigned long long)*a, d ? *d : 0u);
-    return gRealRegionRecurse ? gRealRegionRecurse(m, a, s, d, i, c) : KERN_FAILURE;
+    if (!gRealRegionRecurse || !a) return KERN_FAILURE;
+    kern_return_t kr = gRealRegionRecurse(m, a, s, d, i, c);
+    while (kr == KERN_SUCCESS && s && *s > 0 && AnoAddressIsOurs((const void *)*a)) {
+        ANO_TRACE("vm_region_recurse_64 skipped our region at 0x%llX", (unsigned long long)*a);
+        *a = *a + *s;
+        kr = gRealRegionRecurse(m, a, s, d, i, c);
+    }
+    return kr;
 }
 
-// mach_vm_region_recurse is not in the iOS SDK (mach_vm.h is macOS-only), and
-// vm_region_recurse_64 covers the same walk, so that one is watched instead.
-//
-// _dlopen and _dlsym are deliberately not wrapped. anogs calls them while it is
-// itself being loaded, and anything our wrapper does that lazily binds a symbol
-// re-enters the same slot on the same thread -- a deadlock at launch, which the
-// system kills and the phone reports as a crash. Losing those two lines of
-// telemetry is cheaper than losing the app.
 static int AnoSysctlByName(const char *name, void *oldp, size_t *oldlenp,
                            void *newp, size_t newlen) {
-    // kern.proc.pid.* / kern.procargs expose P_TRACED and the argument vector.
     ANO_TRACE("sysctlbyname %s", name ? name : "(null)");
     return gRealSysctlByName ? gRealSysctlByName(name, oldp, oldlenp, newp, newlen) : -1;
 }
@@ -567,8 +608,59 @@ static void *AnoMemmem(const void *hay, size_t hn, const void *needle, size_t nn
 
 static kern_return_t AnoVmRead(vm_map_read_t t, vm_address_t a, vm_size_t sz,
                                vm_offset_t *data, mach_msg_type_number_t *cnt) {
-    ANO_TRACE("vm_read at=0x%llX size=%u", (unsigned long long)a, (unsigned)sz);
+    if (AnoAddressIsOurs((const void *)a)) {
+        ANO_TRACE("vm_read BLOCKED on our address 0x%llX", (unsigned long long)a);
+        return KERN_PROTECTION_FAILURE;
+    }
     return gRealVmRead ? gRealVmRead(t, a, sz, data, cnt) : KERN_FAILURE;
+}
+
+static BOOL AnoIsSuspiciousPath(const char *p) {
+    if (!p) return NO;
+    if (strstr(p, "PxBoot") || strstr(p, "PxMenu") || strstr(p, "AnoMute") || strstr(p, "PxUE4")) {
+        return YES;
+    }
+    return NO;
+}
+
+static int AnoStat(const char *path, struct stat *buf) {
+    if (AnoIsSuspiciousPath(path)) {
+        ANO_TRACE("stat hidden for %s", path);
+        errno = ENOENT;
+        return -1;
+    }
+    return gRealStat ? gRealStat(path, buf) : -1;
+}
+
+static int AnoLstat(const char *path, struct stat *buf) {
+    if (AnoIsSuspiciousPath(path)) {
+        ANO_TRACE("lstat hidden for %s", path);
+        errno = ENOENT;
+        return -1;
+    }
+    return gRealLstat ? gRealLstat(path, buf) : -1;
+}
+
+static int AnoAccess(const char *path, int mode) {
+    if (AnoIsSuspiciousPath(path)) {
+        ANO_TRACE("access hidden for %s", path);
+        errno = ENOENT;
+        return -1;
+    }
+    return gRealAccess ? gRealAccess(path, mode) : -1;
+}
+
+static int AnoOpen(const char *path, int flags, ...) {
+    if (AnoIsSuspiciousPath(path)) {
+        ANO_TRACE("open hidden for %s", path);
+        errno = ENOENT;
+        return -1;
+    }
+    va_list ap;
+    va_start(ap, flags);
+    mode_t mode = (mode_t)va_arg(ap, int);
+    va_end(ap);
+    return gRealOpen ? gRealOpen(path, flags, mode) : -1;
 }
 
 static void AnoInstallTelemetry(void) {
@@ -577,6 +669,10 @@ static void AnoInstallTelemetry(void) {
     gRealSysctlByName     = dlsym(RTLD_DEFAULT, "sysctlbyname");
     gRealMemmem           = dlsym(RTLD_DEFAULT, "memmem");
     gRealVmRead           = dlsym(RTLD_DEFAULT, "vm_read");
+    gRealStat             = dlsym(RTLD_DEFAULT, "stat");
+    gRealLstat            = dlsym(RTLD_DEFAULT, "lstat");
+    gRealAccess           = dlsym(RTLD_DEFAULT, "access");
+    gRealOpen             = dlsym(RTLD_DEFAULT, "open");
 
     int n = 0;
     if (gRealTaskInfo && AnoRebindInAnogs("_task_info", (void *)AnoTaskInfo, NULL)) n++;
@@ -584,7 +680,11 @@ static void AnoInstallTelemetry(void) {
     if (gRealSysctlByName && AnoRebindInAnogs("_sysctlbyname", (void *)AnoSysctlByName, NULL)) n++;
     if (gRealMemmem && AnoRebindInAnogs("_memmem", (void *)AnoMemmem, NULL)) n++;
     if (gRealVmRead && AnoRebindInAnogs("_vm_read", (void *)AnoVmRead, NULL)) n++;
-    AnoLog(@"telemetry: %d/5 detection imports rebound", n);
+    if (gRealStat && AnoRebindInAnogs("_stat", (void *)AnoStat, NULL)) n++;
+    if (gRealLstat && AnoRebindInAnogs("_lstat", (void *)AnoLstat, NULL)) n++;
+    if (gRealAccess && AnoRebindInAnogs("_access", (void *)AnoAccess, NULL)) n++;
+    if (gRealOpen && AnoRebindInAnogs("_open", (void *)AnoOpen, NULL)) n++;
+    AnoLog(@"telemetry & anti-detection: %d/9 imports rebound", n);
 }
 
 #pragma mark - install
