@@ -13,6 +13,12 @@ PX_TRIPLE = -target arm64-apple-ios14.0
 
 include $(THEOS)/makefiles/common.mk
 
+# The first line of PxBoot.log names the commit that produced the dylib. Two
+# builds of one commit get different LC_UUIDs, so the sha256 changes every time
+# and cannot answer "which build is on the device". The commit can.
+PX_GIT := $(shell git rev-parse --short HEAD 2>/dev/null)
+PX_TAG = $(if $(PX_GIT),$(PX_GIT),dev)
+
 LIBRARY_NAME = PxMenu PxMenuLite AnoMute
 
 PxMenu_FILES = \
@@ -24,8 +30,8 @@ PxMenu_FILES = \
     Menu/PxFloatingButton.m \
     AnoMute/AnoMute.m
 
-PxMenu_CFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -Wno-deprecated-declarations -Wno-unguarded-availability-new -IMenu $(PX_TRIPLE)
-PxMenu_CCFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -Wno-deprecated-declarations -Wno-unguarded-availability-new -std=gnu++17 -IMenu $(PX_TRIPLE)
+PxMenu_CFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -Wno-deprecated-declarations -Wno-unguarded-availability-new -IMenu -DPX_BUILD_TAG=\"$(PX_TAG)\" $(PX_TRIPLE)
+PxMenu_CCFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -Wno-deprecated-declarations -Wno-unguarded-availability-new -std=gnu++17 -IMenu -DPX_BUILD_TAG=\"$(PX_TAG)\" $(PX_TRIPLE)
 PxMenu_FRAMEWORKS = UIKit Foundation QuartzCore
 # No -Wl,-u,_OBJC_CLASS_$_PxEntry here: the shell eats $_PxEntry on the way to
 # the linker and the build dies on "_OBJC_CLASS_". The class list is not the

@@ -7,6 +7,13 @@
 #import "PxMenuView.h"
 #import "PxStore.h"
 
+// Stamped by the Makefile from `git rev-parse --short HEAD`. The log's first line
+// carries it so "which build is on the device" is answered by reading the log
+// instead of guessing from a sha256 that changes on every link.
+#ifndef PX_BUILD_TAG
+#define PX_BUILD_TAG "dev"
+#endif
+
 // The dylib is injected into the host app, so there is no app delegate to hook.
 // Wait for a key window, install, and re-assert on foreground.
 static NSInteger const kPxMaxInstallAttempts = 120;   // 120 * 0.25s = 30s
@@ -232,7 +239,7 @@ static void PxMenuStart(const char *via) {
     if (started) { PxLog(@"entry %s: already started", via); return; }
     started = YES;
 
-    PxLog(@"=== PxMenu entry via %s, %u dyld images ===", via,
+    PxLog(@"=== PxMenu build %s entry via %s, %u dyld images ===", PX_BUILD_TAG, via,
           (unsigned)_dyld_image_count());
 
     // The marker is written just before the UI installs and removed once it

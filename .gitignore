@@ -3,3 +3,6 @@ packages/
 bypassmenu-build/
 *.zip
 work/
+# Build output. The CI download helper writes _art/, and three dylibs were
+# committed by accident -- they change on every build and bloat the history.
+_art/
