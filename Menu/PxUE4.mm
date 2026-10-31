@@ -17,6 +17,8 @@
 #import <string.h>
 #import <math.h>
 
+static void PxUELog(NSString *fmt, ...);
+
 // ---------------------------------------------------------------- layouts --
 // Delta Force ships a modified UE4. The shipped cheat reads UObject::Class at
 // +0x08 and the FName at +0x1C; stock 4.23-4.27 uses +0x10 and +0x18. Neither
@@ -217,6 +219,11 @@ static uint64_t g_objArray;     // &TUObjectArray::Objects
 static uint32_t g_peIndex;      // UObject::ProcessEvent vtable slot
 static uint32_t g_objCount;
 
+static BOOL     g_nameCrypted = YES; // ansi name bytes are obfuscated in this build
+static uint64_t g_namePool;     // &FNamePool global, decoded from __text
+static uint64_t g_uobjArray;    // &FUObjectArray global, decoded from __text
+static BOOL     g_staticTried;
+
 static uint64_t g_classGPChar;  // UClass "GPCharacterBase" (informational)
 static uint64_t g_classCamMgr;  // UClass "PlayerCameraManager"
 static uint64_t g_classActor;   // UClass "Actor"
@@ -248,6 +255,25 @@ static BOOL g_scanning;
 static BOOL g_published;   // the one flag the main thread may trust
 
 // ------------------------------------------------------------ name lookup --
+// Names are stored obfuscated: the length in the header stays plaintext, and
+// every byte is xored with a key derived from it, so the key needs no table.
+static void pxUnmask(char *s, uint32_t len) {
+    if (!s || len == 0) return;
+    uint32_t key;
+    switch (len % 9) {
+        case 0:  key = (len & 0x1F) + len; break;
+        case 1:  key = (len ^ 0xDF) + len; break;
+        case 2:  key = (len | 0xCF) + len; break;
+        case 3:  key = 33 * len; break;
+        case 4:  key = len + (len >> 2); break;
+        case 5:  key = 3 * len + 5; break;
+        case 6:  key = ((4 * len) | 5) + len; break;
+        case 7:  key = ((len >> 4) | 7) + len; break;
+        default: key = (len ^ 0xC) + len; break;
+    }
+    for (uint32_t i = 0; i < len; i++) s[i] = (char)((uint8_t)~(uint8_t)s[i] ^ (uint8_t)(key & 0x80));
+}
+
 static BOOL pxNameAt(uint32_t index, char *out, size_t cap) {
     if (!g_nameBlocks || cap < 2) return NO;
     uint32_t block = index >> g_nameShift;
@@ -272,6 +298,7 @@ static BOOL pxNameAt(uint32_t index, char *out, size_t cap) {
         size_t n = MIN(bytes, cap - 1);
         memcpy(out, (const void *)strAddr, n);
         out[n] = 0;
+        if (g_nameCrypted) pxUnmask(out, (uint32_t)n);
         return YES;
     }
     uint32_t i = 0;
@@ -420,6 +447,7 @@ static BOOL pxFindNamePool(void) {
         if (good < 1) return;
 
         g_nameBlocks = p;
+        g_nameCrypted = NO;    // the raw bytes already spelled "None"
         char tmp[16];
         if (pxNameAt(0, tmp, sizeof(tmp)) && strcmp(tmp, "None") == 0) { found = YES; return; }
         g_nameBlocks = 0;
@@ -496,6 +524,173 @@ static BOOL pxFindObjectArray(void) {
         if (picked >= 0) { g_objHits++; found = YES; }
     });
     return found;
+}
+
+// ------------------------------------------------------- static pointers --
+// Both globals are ordinary __DATA slots, and the build keeps the ADRL pairs
+// that reach them. Decoding a pattern hit yields the address outright: no heap
+// walk, no candidate scoring, nothing to calibrate away.
+typedef struct {
+    const uint8_t *pat;
+    const uint8_t *mask;
+    uint32_t len;
+    uint32_t step;      // offset from the pattern hit to the adrp
+} PxPat;
+
+// 4f d3 ?? ?? 7d 92 ?? ?? ?? ?? ?? ?? ?? 91
+static const uint8_t kPatNames[]  = { 0x4F, 0xD3, 0, 0, 0x7D, 0x92, 0, 0, 0, 0, 0, 0, 0, 0x91 };
+static const uint8_t kMaskNames[] = { 0xFF, 0xFF, 0, 0, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0xFF };
+
+// 94 e0 23 00 91 ?? ?? ?? 94 08 7d 80 52   (FUObjectArray ctor)
+static const uint8_t kPatUObj0[]  = { 0x94, 0xE0, 0x23, 0x00, 0x91, 0, 0, 0, 0x94, 0x08, 0x7D, 0x80, 0x52 };
+static const uint8_t kMaskUObj0[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+
+// 40 20 1e ?? 03 ?? aa ?? 03 ?? aa ?? ?? 40 b9 ?? ?? ?? ?? ?? ?? ?? 91
+static const uint8_t kPatUObj4[]  = { 0x40, 0x20, 0x1E, 0, 0x03, 0, 0xAA, 0, 0x03, 0, 0xAA, 0, 0,
+                                      0x40, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0x91 };
+static const uint8_t kMaskUObj4[] = { 0xFF, 0xFF, 0xFF, 0, 0xFF, 0, 0xFF, 0, 0xFF, 0, 0xFF, 0, 0,
+                                      0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0xFF };
+
+static BOOL pxCodeMatch(uint64_t at, const PxPat *p) {
+    if (!pxInHostCode(at, p->len)) return NO;
+    for (uint32_t i = 0; i < p->len; i++) {
+        if (!p->mask[i]) continue;
+        if (*(const volatile uint8_t *)(at + i) != p->pat[i]) return NO;
+    }
+    return YES;
+}
+
+// adrp + add #imm, the idiom that reaches a global without a GOT slot.
+static BOOL pxAdrlAt(uint64_t at, uint64_t *out) {
+    if (!pxInHostCode(at, 8)) return NO;
+    uint32_t i0 = *(const volatile uint32_t *)at;
+    uint32_t i1 = *(const volatile uint32_t *)(at + 4);
+    if ((i0 & 0x9F000000u) != 0x90000000u) return NO;
+
+    int64_t imm = (int64_t)((((i0 >> 5) & 0x7FFFFu) << 2) | ((i0 >> 29) & 3u));
+    if (imm & (1 << 20)) imm -= (1 << 21);
+    uint64_t addr = (at & ~0xFFFULL) + (uint64_t)imm * 4096;   // wraps for negative imm
+
+    if ((i1 & 0x7F800000u) == 0x11000000u && ((i1 >> 22) & 1u) == 0 &&
+        ((i1 >> 5) & 0x1Fu) == (i0 & 0x1Fu))
+        addr += (uint64_t)((i1 >> 10) & 0xFFFu);
+    *out = addr;
+    return YES;
+}
+
+// Byte-at-a-time over 300 MB is too slow; hunt the first pattern byte with the
+// classic zero-byte trick, then verify the mask at the few hits it turns up.
+static uint64_t pxScanCode(const PxPat *p, uint64_t *out) {
+    const uint64_t kLo = 0x0101010101010101ULL;
+    const uint64_t kHi = 0x8080808080808080ULL;
+    const uint64_t splat = kLo * p->pat[0];
+
+    for (int r = 0; r < g_codeCount; r++) {
+        uint64_t lo = g_code[r].lo, hi = g_code[r].hi;
+        for (uint64_t a = lo; a + 8 <= hi; a += 8) {
+            uint64_t v = *(const volatile uint64_t *)a;
+            uint64_t x = v ^ splat;
+            uint64_t m = (x - kLo) & ~x & kHi;
+            while (m) {
+                uint32_t hit = __builtin_ctzll(m) >> 3;
+                m &= m - 1;
+                uint64_t at = a + hit;
+                if (!pxCodeMatch(at, p)) continue;
+                if (pxAdrlAt(at + p->step, out)) return at;
+            }
+        }
+    }
+    return 0;
+}
+
+// Blocks sits at a fixed offset inside the pool; which one differs per build, so
+// both are tried and the one that resolves index 0 to "None" wins. That check
+// also settles whether the name bytes are obfuscated.
+static BOOL pxPoolWorks(uint64_t blocks, BOOL *cryptedOut) {
+    uint64_t saveBlocks = g_nameBlocks;
+    BOOL saveCrypted = g_nameCrypted;
+    char nm[16];
+    BOOL ok = NO;
+
+    g_nameBlocks = blocks;
+
+    g_nameCrypted = YES;
+    if (pxNameAt(0, nm, sizeof(nm)) && strcmp(nm, "None") == 0) { ok = YES; *cryptedOut = YES; }
+
+    if (!ok) {
+        g_nameCrypted = NO;
+        if (pxNameAt(0, nm, sizeof(nm)) && strcmp(nm, "None") == 0) { ok = YES; *cryptedOut = NO; }
+    }
+
+    g_nameBlocks = saveBlocks;
+    g_nameCrypted = saveCrypted;
+    return ok;
+}
+
+static void pxResolveStatics(void) {
+    // The pointers are fixed once the image is mapped, but the pool behind them
+    // fills in during boot, so the validation gets a few more chances.
+    if (g_staticTried >= 8) return;
+    if (!g_imgBase) return;
+    if (g_nameBlocks && g_objArray) { g_staticTried = 8; return; }
+    g_staticTried++;
+
+    static const PxPat kNames = { kPatNames, kMaskNames, 14, 6 };
+    static const PxPat kUObj0 = { kPatUObj0, kMaskUObj0, 13, 0x11 };
+    static const PxPat kUObj4 = { kPatUObj4, kMaskUObj4, 23, 0x0F };
+
+    if (!g_namePool) pxScanCode(&kNames, &g_namePool);
+    if (!g_uobjArray && !pxScanCode(&kUObj0, &g_uobjArray))
+        pxScanCode(&kUObj4, &g_uobjArray);
+
+    uint64_t namesAddr = g_namePool, objAddr = g_uobjArray;
+
+    if (namesAddr) {
+        static const uint32_t kOff[] = { 0x38, 0x40 };
+        for (int i = 0; i < 2 && !g_nameBlocks; i++) {
+            uint64_t cand = namesAddr + kOff[i];
+            uint64_t deref = 0;
+            if (pxPoolWorks(cand, &g_nameCrypted)) {
+                g_nameBlocks = cand;
+            } else if (pxRd64(cand, &deref) && deref && pxPoolWorks(deref, &g_nameCrypted)) {
+                g_nameBlocks = deref;
+            }
+        }
+    }
+
+    if (objAddr) {
+        // FUObjectArray::ObjObjects then TUObjectArray::Objects; the counts sit
+        // around the chunk slot, which pxProbeObjectArray already knows how to
+        // score. Fall back to a read-back if the strict probe says no.
+        static const uint32_t kSlot[]     = { 0x20, 0x10 };
+        static const int32_t  kMaxDelta[] = { 0x10, 8, -0xC };
+        static const int32_t  kNumDelta[] = { 0x14, 12, -8 };
+
+        for (int s = 0; s < 2 && !g_objArray; s++) {
+            for (int d = 0; d < 3; d++) {
+                uint32_t num = 0;
+                if (!pxProbeObjectArray(objAddr + kSlot[s], kMaxDelta[d], kNumDelta[d], &num)) continue;
+                g_objArray = objAddr + kSlot[s];
+                g_arrMaxDelta = kMaxDelta[d];
+                g_arrNumDelta = kNumDelta[d];
+                g_objCount = num;
+                break;
+            }
+        }
+        if (!g_objArray) {
+            g_objArray = objAddr + kSlot[0];
+            g_arrMaxDelta = kMaxDelta[0];
+            g_arrNumDelta = kNumDelta[0];
+            g_objCount = pxObjectCount();
+            uint64_t obj = 0;
+            int live = 0;
+            for (uint32_t i = 0; i < 64; i++) if (pxObjectAt(i, &obj)) live++;
+            if (live < 8) g_objArray = 0;
+        }
+    }
+
+    PxUELog(@"statics: GNames=0x%llX pool=0x%llX crypted=%d GObjects=0x%llX chunks=0x%llX count=0x%X",
+            namesAddr, g_nameBlocks, (int)g_nameCrypted, objAddr, g_objArray, g_objCount);
 }
 
 // ------------------------------------------------------------- calibration --
@@ -905,6 +1100,10 @@ static void pxDumpSDK(NSMutableString *summary) {
     g_objArray = 0;
     g_peIndex = 0;
     g_objCount = 0;
+    g_namePool = 0;
+    g_uobjArray = 0;
+    g_staticTried = NO;
+    g_nameCrypted = YES;
     g_layoutOK = NO;
     g_layoutScore = 0;
     g_arrHasAlt = NO;
@@ -956,6 +1155,8 @@ static void pxDumpSDK(NSMutableString *summary) {
 - (void)scanOnce {
     pxBuildRanges();                 // the heap grows between attempts
     if (!g_imgBase && !pxLoadHostImage()) { pxSetStatus(@"host image not found"); return; }
+
+    pxResolveStatics();              // static globals first: no heap walk needed
 
     if (!g_nameBlocks && !pxFindNamePool()) {
         pxSetStatus(@"GNames not found");
