@@ -95,6 +95,11 @@ static UIWindowScene *PxActiveScene(void) {
     if (!firstTick) { firstTick = 1; PxLogShared(@"overlay tick 1"); }
 
     self.tick++;
+    if (@available(iOS 13.0, *)) {
+        if (self.window && !self.window.windowScene) {
+            self.window.windowScene = PxActiveScene();
+        }
+    }
     if (![PxUE4 shared].ready) [[PxUE4 shared] scanIfNeeded];
 
     // The window is only allowed on screen when it can actually draw something.

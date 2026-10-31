@@ -623,10 +623,11 @@ static void pxResolveStatics(void) {
     // pattern is scanned at most once: a miss is remembered, because a pass over
     // 327 MB of __text is seconds of CPU on an A11 and repeating it every 1.5 s
     // would starve the game for no new information.
-    if (g_staticTried >= 4) return;
     if (!g_imgBase) return;
     if (g_nameBlocks && g_objArray) { g_staticTried = 4; return; }
-    g_staticTried++;
+    // A resolved global can remain uninitialised for longer than four passes.
+    // Pattern misses are cached separately; keep probing the live globals.
+    if (g_staticTried < 4) g_staticTried++;
 
     static const PxPat kNames = { kPatNames, kMaskNames, 14, 6 };
     static const PxPat kUObj0 = { kPatUObj0, kMaskUObj0, 13, 0x11 };
@@ -1289,6 +1290,12 @@ static void pxDumpSDK(NSMutableString *summary) {
         g_fnTeammate  = pxFindFunction(g_classGPChar, "BP_IsCharacterTeammate");
         g_fnHealth    = pxFindFunction(g_classGPChar, "GetHealth");
         g_fnHealthMax = pxFindFunction(g_classGPChar, "GetHealthMax");
+    }
+
+    if (!g_fnActorLoc || !g_fnCamLoc || !g_fnCamRot) {
+        pxSetStatus([NSString stringWithFormat:@"waiting for ESP functions loc=%llX cam=%llX/%llX",
+                     g_fnActorLoc, g_fnCamLoc, g_fnCamRot]);
+        return;
     }
 
     if (!g_charClasses) g_charClasses = [NSMutableArray array];

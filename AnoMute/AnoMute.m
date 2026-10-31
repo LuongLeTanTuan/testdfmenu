@@ -656,11 +656,15 @@ static int AnoOpen(const char *path, int flags, ...) {
         errno = ENOENT;
         return -1;
     }
-    va_list ap;
-    va_start(ap, flags);
-    mode_t mode = (mode_t)va_arg(ap, int);
-    va_end(ap);
-    return gRealOpen ? gRealOpen(path, flags, mode) : -1;
+    if (!gRealOpen) { errno = ENOSYS; return -1; }
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode_t mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+        return gRealOpen(path, flags, mode);
+    }
+    return gRealOpen(path, flags);
 }
 
 static void AnoInstallTelemetry(void) {
