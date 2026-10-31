@@ -12,6 +12,7 @@
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
 #import <mach/mach.h>
+#import <mach/vm_region.h>
 #import <dlfcn.h>
 #import <stdarg.h>
 #import <string.h>
@@ -245,6 +246,25 @@ static void AnoDump(const char *tag, const char *p, size_t n) {
     NSLog(@"[AnoMute] %s %zu bytes -> %@", tag, n, f);
 }
 
+// How many bytes from `p` to the end of the mapping that contains it, 0 if the
+// mapping is gone or unreadable. strnlen on an unterminated buffer walks off the
+// end and faults; the report length is not ours to assume, so ask the kernel
+// where the page ends first.
+static size_t AnoReadableFrom(const void *p) {
+    vm_address_t addr = (vm_address_t)p;
+    vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    if (vm_region_64(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                     (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
+        return 0;
+    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+    if (!(info.protection & VM_PROT_READ)) return 0;
+    if ((vm_address_t)p < addr) return 0;
+    return (size_t)(addr + size - (vm_address_t)p);
+}
+
 // Returns the app's view of the report. Text reports get flags neutralised in
 // place-in-copy; binary reports are passed through untouched because there is
 // no safe way to edit a format we have not parsed yet.
@@ -253,7 +273,11 @@ static void *AnoGetReport(void) {
     char *p = (char *)gOrigGetReport();
     if (!p) return NULL;
 
-    size_t n = strnlen(p, kAnoReportCap - 1);
+    size_t cap = AnoReadableFrom(p);
+    if (cap > kAnoReportCap - 1) cap = kAnoReportCap - 1;
+    if (cap == 0) return p;
+
+    size_t n = strnlen(p, cap);
     if (n == 0) return p;
 
     AnoDump("raw", p, n);
