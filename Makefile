@@ -21,7 +21,8 @@ PxMenu_FILES = \
     Menu/PxMenuView.m \
     Menu/PxOverlay.m \
     Menu/PxUE4.mm \
-    Menu/PxFloatingButton.m
+    Menu/PxFloatingButton.m \
+    AnoMute/AnoMute.m
 
 PxMenu_CFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -Wno-deprecated-declarations -Wno-unguarded-availability-new -IMenu $(PX_TRIPLE)
 PxMenu_CCFLAGS = -fobjc-arc -Wall -Wno-unused-parameter -Wno-deprecated-declarations -Wno-unguarded-availability-new -std=gnu++17 -IMenu $(PX_TRIPLE)
