@@ -24,6 +24,8 @@ static UIWindowScene *PxActiveScene(void) {
 }
 
 
+@implementation PxOverlay
+
 + (instancetype)shared {
     static PxOverlay *overlay;
     static dispatch_once_t once;
@@ -54,9 +56,7 @@ static UIWindowScene *PxActiveScene(void) {
         // A window created without a scene on iOS 13+ stays detached and never
         // draws, even with hidden = NO.
         if (@available(iOS 13.0, *)) {
-            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-                if ([s isKindOfClass:[UIWindowScene class]]) { window.windowScene = (UIWindowScene *)s; break; }
-            }
+            window.windowScene = PxActiveScene();
         }
         window.hidden = YES;   // shown only while the ESP is actually enabled
         [window.rootViewController.view addSubview:overlay];
