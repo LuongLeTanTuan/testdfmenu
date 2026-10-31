@@ -514,6 +514,13 @@ static const void * const kPxControlKey = &kPxControlKey;
         window.backgroundColor = [UIColor clearColor];
         window.rootViewController = [[UIViewController alloc] init];
         window.rootViewController.view.backgroundColor = [UIColor clearColor];
+        // Same reason as PxOverlay: a window with no scene never attaches on
+        // iOS 13+, so the menu would be built, hidden = NO, and invisible.
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]]) { window.windowScene = (UIWindowScene *)s; break; }
+            }
+        }
         window.hidden = NO;
         [window.rootViewController.view addSubview:self];
         self.hostWindow = window;
