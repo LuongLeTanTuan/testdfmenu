@@ -164,9 +164,19 @@ static void PxInstallUI(NSInteger attempt) {
             // be reached -- a loop with no way out from the device itself.
             // The display link still starts here (the skin re-apply rides on
             // it); only the ESP window stays down until the switch is touched.
-            BOOL persisted = [PxStore boolForKey:@"esp_players"];
-            [[PxOverlay shared] setEnabled:NO];
-            PxLog(@"overlay enabled=0 (persisted esp=%d, deferred to the menu switch)", (int)persisted);
+            //
+            // Once only: PxInstallUI runs again on every foreground, and doing
+            // this each time silently switched ESP off whenever the user
+            // backgrounded the game and came back.
+            static BOOL deferDone;
+            if (!deferDone) {
+                deferDone = YES;
+                BOOL persisted = [PxStore boolForKey:@"esp_players"];
+                [[PxOverlay shared] setEnabled:NO];
+                PxLog(@"overlay enabled=0 (persisted esp=%d, deferred to the menu switch)", (int)persisted);
+            } else {
+                PxLog(@"overlay already installed, ESP state left alone");
+            }
         } @catch (NSException *e) {
             PxLog(@"overlay enable threw: %@", e);
         }

@@ -1,6 +1,7 @@
 #import "PxFloatingButton.h"
 #import "PxMenuView.h"
 #import "PxStore.h"
+#import "PxUE4.h"
 
 static NSString * const kPxButtonXKey = @"px_btn_x";
 static NSString * const kPxButtonYKey = @"px_btn_y";
@@ -8,6 +9,7 @@ static NSString * const kPxButtonYKey = @"px_btn_y";
 @interface PxFloatingButton ()
 @property (nonatomic, strong) UIButton *button;
 @property (nonatomic, assign) BOOL dragging;
+@property (nonatomic, assign) NSInteger attachTries;
 @end
 
 @implementation PxFloatingButton
@@ -24,18 +26,9 @@ static NSString * const kPxButtonYKey = @"px_btn_y";
         CGFloat y = savedY > 0 ? savedY : screen.size.height * 0.35;
 
         instance = [[PxFloatingButton alloc] initWithFrame:CGRectMake(x, y, side, side)];
-        instance.windowLevel = UIWindowLevelAlert + 100;
         instance.backgroundColor = [UIColor clearColor];
-        instance.rootViewController = [[UIViewController alloc] init];
-        instance.rootViewController.view.backgroundColor = [UIColor clearColor];
-        // Same reason as PxOverlay: no scene means the window never appears.
-        if (@available(iOS 13.0, *)) {
-            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-                if ([s isKindOfClass:[UIWindowScene class]]) { instance.windowScene = (UIWindowScene *)s; break; }
-            }
-        }
+        instance.userInteractionEnabled = YES;
         [instance buildButton];
-        instance.hidden = NO;
     });
     return instance;
 }
@@ -57,18 +50,57 @@ static NSString * const kPxButtonYKey = @"px_btn_y";
     [self.button setTitle:@"PX" forState:UIControlStateNormal];
     [self.button setTitleColor:[UIColor colorWithRed:0.35 green:0.95 blue:0.60 alpha:1] forState:UIControlStateNormal];
     [self.button addTarget:self action:@selector(buttonTapped) forControlEvents:UIControlEventTouchUpInside];
-    [self.rootViewController.view addSubview:self.button];
+    [self addSubview:self.button];
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
     [self.button addGestureRecognizer:pan];
 }
 
+// The key window, preferring one that already has a scene and a visible size.
+// [UIApplication windows] is deprecated but still the only call that returns the
+// host's window when the game never adopts a scene delegate.
+static UIWindow *PxHostWindow(void) {
+    UIWindow *fallback = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.hidden) continue;
+        if (!fallback) fallback = w;
+        if (w.isKeyWindow) return w;
+    }
+    if (fallback) return fallback;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) return w;
+    return nil;
+}
+
 - (void)showButton {
+    UIWindow *host = PxHostWindow();
+    if (!host) {
+        // No window yet. Try again for a few seconds rather than giving up: the
+        // game builds its window after the menu's install delay on a cold start.
+        if (self.attachTries < 20) {
+            self.attachTries++;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ [self showButton]; });
+        } else {
+            PxLogShared(@"button attach: no host window after %ld tries", (long)self.attachTries);
+        }
+        return;
+    }
+    self.attachTries = 0;
+
+    if (self.superview != host) [self removeFromSuperview];
+    if (self.superview != host) [host addSubview:self];
+    [host bringSubviewToFront:self];
     self.hidden = NO;
+
+    PxLogShared(@"button attach: host=%@ level=%.0f frame=%@ onTop=%d",
+                NSStringFromClass([host class]), host.windowLevel,
+                NSStringFromCGRect(self.frame),
+                (int)(host.subviews.lastObject == self));
 }
 
 - (void)hideButton {
     self.hidden = YES;
+    [self removeFromSuperview];
 }
 
 - (void)buttonTapped {
@@ -82,9 +114,9 @@ static NSString * const kPxButtonYKey = @"px_btn_y";
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
-    CGPoint translation = [pan translationInView:self];
+    CGPoint translation = [pan translationInView:self.superview];
     CGPoint center = CGPointMake(self.center.x + translation.x, self.center.y + translation.y);
-    [pan setTranslation:CGPointZero inView:self];
+    [pan setTranslation:CGPointZero inView:self.superview];
 
     CGRect screen = UIScreen.mainScreen.bounds;
     CGFloat half = self.bounds.size.width / 2;
