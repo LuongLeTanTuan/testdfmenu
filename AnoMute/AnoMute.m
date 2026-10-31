@@ -272,6 +272,11 @@ static void AnoInstall(NSInteger attempt) {
 
 __attribute__((constructor))
 static void AnoMuteEntry(void) {
+    // Logged at load time, before the delay: if this line is missing from the
+    // boot log while PxMenu's constructor line is present, this image never
+    // finished loading and the crash is below both of us.
+    AnoLog(@"=== AnoMute constructor, %u dyld images ===", (unsigned)_dyld_image_count());
+
     // 0.5 s: after the host's +load chain has had a chance to dlopen anogs, and
     // early enough to matter -- the old 3 s start was after the reported crash.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
