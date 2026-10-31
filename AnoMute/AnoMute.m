@@ -58,29 +58,61 @@ static char gScrubBuf[kAnoReportCap];
 
 #pragma mark - symbol slots
 
+// File offsets in a Mach-O are not virtual addresses. For any image where
+// __LINKEDIT.fileoff != __LINKEDIT.vmaddr -- true of every binary with a large
+// __bss, including the game itself -- `base + symoff` lands in the middle of
+// __DATA, and the "symbol table" read from there is heap garbage. The old code
+// did exactly that and died inside strcmp before it could log anything.
+static const uint8_t *AnoAddrOfFileRange(const struct mach_header_64 *mh,
+                                         const struct segment_command_64 **segs,
+                                         int segCount, uint64_t textVM,
+                                         uint32_t fileoff, uint64_t size) {
+    for (int i = 0; i < segCount; i++) {
+        const struct segment_command_64 *sg = segs[i];
+        if (fileoff < sg->fileoff) continue;
+        if ((uint64_t)fileoff + size > sg->fileoff + sg->filesize) continue;
+        return (const uint8_t *)mh + (sg->vmaddr - textVM) + (fileoff - sg->fileoff);
+    }
+    return NULL;
+}
+
 static BOOL AnoRebindInImage(const struct mach_header_64 *mh, const char *want,
                              void *replacement, void **outOriginal) {
+    // A shared-cache image keeps symoff/indirectsymoff as offsets into the cache
+    // file, not into the image, so no arithmetic on `base` can reach them.
+    if (mh->flags & MH_DYLIB_IN_CACHE) return NO;
+
     const struct symtab_command *symtab = NULL;
     const struct dysymtab_command *dysym = NULL;
     const struct segment_command_64 *segs[64];
     int segCount = 0;
+    uint64_t textVM = 0;
 
     const uint8_t *base = (const uint8_t *)mh;
     const struct load_command *lc = (const struct load_command *)(base + sizeof(*mh));
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         if (lc->cmd == LC_SYMTAB) symtab = (const struct symtab_command *)lc;
         else if (lc->cmd == LC_DYSYMTAB) dysym = (const struct dysymtab_command *)lc;
-        else if (lc->cmd == LC_SEGMENT_64 && segCount < 64)
-            segs[segCount++] = (const struct segment_command_64 *)lc;
+        else if (lc->cmd == LC_SEGMENT_64 && segCount < 64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            segs[segCount++] = sg;
+            if (strcmp(sg->segname, "__TEXT") == 0) textVM = sg->vmaddr;
+        }
         lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
     }
-    if (!symtab || !dysym) return NO;
+    if (!symtab || !dysym || segCount == 0) return NO;
 
-    const struct nlist_64 *syms  = (const struct nlist_64 *)(base + symtab->symoff);
-    const char            *strs  = (const char *)(base + symtab->stroff);
-    const uint32_t        *indir = (const uint32_t *)(base + dysym->indirectsymoff);
+    const struct nlist_64 *syms = (const struct nlist_64 *)AnoAddrOfFileRange(
+        mh, segs, segCount, textVM, symtab->symoff,
+        (uint64_t)symtab->nsyms * sizeof(struct nlist_64));
+    const char *strs = (const char *)AnoAddrOfFileRange(
+        mh, segs, segCount, textVM, symtab->stroff, symtab->strsize);
+    const uint32_t *indir = (const uint32_t *)AnoAddrOfFileRange(
+        mh, segs, segCount, textVM, dysym->indirectsymoff,
+        (uint64_t)dysym->nindirectsyms * sizeof(uint32_t));
+    if (!syms || !strs || !indir) return NO;
+
     BOOL hit = NO;
-
     for (int s = 0; s < segCount; s++) {
         const struct segment_command_64 *seg = segs[s];
         const struct section_64 *sect = (const struct section_64 *)((const uint8_t *)seg + sizeof(*seg));
@@ -90,26 +122,29 @@ static BOOL AnoRebindInImage(const struct mach_header_64 *mh, const char *want,
             if (sect->size == 0) continue;
 
             uint32_t count = (uint32_t)(sect->size / sizeof(void *));
-            void **slots = (void **)(base + sect->offset);
+            if (sect->reserved1 >= dysym->nindirectsyms) continue;
+            if ((uint64_t)sect->reserved1 + count > dysym->nindirectsyms) continue;
+
+            const uint8_t *slotBase = (const uint8_t *)mh + (sect->addr - textVM);
             for (uint32_t k = 0; k < count; k++) {
                 uint32_t si = indir[sect->reserved1 + k];
                 if (si == INDIRECT_SYMBOL_LOCAL || si == INDIRECT_SYMBOL_ABS) continue;
                 if (si >= symtab->nsyms) continue;
-                const char *nm = strs + syms[si].n_un.n_strx;
-                if (strcmp(nm, want) != 0) continue;
+                uint32_t strx = syms[si].n_un.n_strx;
+                if (strx == 0 || strx >= symtab->strsize) continue;
+                if (strcmp(strs + strx, want) != 0) continue;
 
-                void **slot = &slots[k];
-                // The slot lives in __DATA and dyld already had it writable; a
-                // fresh vm_protect is still required because some builds map it
-                // RO after binding.
+                void **slot = (void **)(uintptr_t)(slotBase + k * sizeof(void *));
                 uintptr_t page = (uintptr_t)slot & ~(uintptr_t)(getpagesize() - 1);
-                size_t len = getpagesize();
-                vm_protect(mach_task_self(), (vm_address_t)page, len, false,
+                vm_protect(mach_task_self(), (vm_address_t)page, getpagesize(), false,
                            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
                 if (outOriginal && !*outOriginal) *outOriginal = *slot;
                 *slot = replacement;
-                vm_protect(mach_task_self(), (vm_address_t)page, len, false,
-                           VM_PROT_READ | VM_PROT_EXECUTE);
+                // Leave the page writable. It held a pointer table, dyld may
+                // lazy-bind into it later, and forcing it back to RX would turn
+                // that into a fault inside the host.
+                vm_protect(mach_task_self(), (vm_address_t)page, getpagesize(), false,
+                           VM_PROT_READ | VM_PROT_WRITE);
                 hit = YES;
             }
         }
@@ -117,12 +152,16 @@ static BOOL AnoRebindInImage(const struct mach_header_64 *mh, const char *want,
     return hit;
 }
 
+static uint32_t gAnoScanned, gAnoSkipped;
+
 static BOOL AnoRebindEverywhere(const char *want, void *replacement, void **outOriginal) {
     BOOL any = NO;
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         const struct mach_header *mh = _dyld_get_image_header(i);
-        if (!mh || mh->magic != MH_MAGIC_64) continue;  // skip arm64e/32-bit slices
+        if (!mh || mh->magic != MH_MAGIC_64) { gAnoSkipped++; continue; }
+        if (((const struct mach_header_64 *)mh)->flags & MH_DYLIB_IN_CACHE) { gAnoSkipped++; continue; }
+        gAnoScanned++;
         if (AnoRebindInImage((const struct mach_header_64 *)mh, want, replacement, outOriginal))
             any = YES;
     }
@@ -156,7 +195,7 @@ static BOOL AnoLooksTextual(const char *p, size_t n) {
 
 static size_t AnoScrub(char *buf, size_t n) {
     size_t changed = 0;
-    for (int k = 0; kAnoFlagKeys[k]; k++) {
+    for (int k = 0; kAnoFlagKeys[k] != NULL; k++) {
         const char *key = kAnoFlagKeys[k];
         size_t klen = strlen(key);
         for (size_t i = 0; i + klen < n; i++) {
@@ -244,6 +283,7 @@ static void AnoInstall(NSInteger attempt) {
     // __stub_helper until first call, and calling that would be fatal.
     gOrigGetReport = dlsym(RTLD_DEFAULT, "AnoSDKGetReportData");
     gOrigIoctl     = dlsym(RTLD_DEFAULT, "AnoSDKIoctl");
+    AnoLog(@"dlsym get=%p ioctl=%p", gOrigGetReport, gOrigIoctl);
 
     if (!gOrigGetReport) {
         // anogs is dlopen'd by the host, and the order is not guaranteed. The
@@ -260,6 +300,8 @@ static void AnoInstall(NSInteger attempt) {
 
     void *tmp = NULL;
     BOOL any = NO;
+    gAnoScanned = gAnoSkipped = 0;
+    AnoLog(@"walk begin, %u images", _dyld_image_count());
     any |= AnoRebindEverywhere("_AnoSDKGetReportData",  (void *)AnoGetReport, &tmp);
     any |= AnoRebindEverywhere("_AnoSDKGetReportData2", (void *)AnoGetReport, NULL);
     any |= AnoRebindEverywhere("_AnoSDKGetReportData3", (void *)AnoGetReport, NULL);
@@ -267,7 +309,8 @@ static void AnoInstall(NSInteger attempt) {
     if (gOrigIoctl)
         any |= AnoRebindEverywhere("_AnoSDKIoctl", (void *)AnoIoctl, NULL);
 
-    AnoLog(@"rebind %s (orig %p) after %ld attempt(s)", any ? "OK" : "MISSED", gOrigGetReport, (long)attempt);
+    AnoLog(@"rebind %s (orig %p) attempt=%ld scanned=%u skipped=%u",
+           any ? "OK" : "MISSED", gOrigGetReport, (long)attempt, gAnoScanned, gAnoSkipped);
 }
 
 __attribute__((constructor))

@@ -70,11 +70,10 @@ static NSString *PxMarkerPath(void) {
 
 // Proves the process is still alive between install steps. A log that stops on a
 // heartbeat with no exception above it means something outside this dylib killed
-// the app, which no amount of local hardening can fix.
+// the app, which no amount of local hardening can fix. Every tick is logged:
+// the resolution is what tells us which step was running.
 static void PxHeartbeat(NSInteger tick, NSInteger total) {
-    if (tick == 0 || tick % 4 == 0) {
-        PxLog(@"heartbeat %ld/%ld images=%u", (long)tick, (long)total, (unsigned)_dyld_image_count());
-    }
+    PxLog(@"heartbeat %ld/%ld images=%u", (long)tick, (long)total, (unsigned)_dyld_image_count());
     if (tick >= total) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
