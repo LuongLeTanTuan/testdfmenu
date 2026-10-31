@@ -1098,6 +1098,16 @@ static NSString *PxArtifactPath(NSString *leaf) {
     return [dir stringByAppendingPathComponent:leaf];
 }
 
+// Same, for the callers that need a directory rather than a file: the ue4 dir is
+// created above, the leaf is not. Passing a file path to stringByAppendingPathComponent
+// makes every write fail with no error and no log line.
+static NSString *PxArtifactDir(NSString *leaf) {
+    NSString *dir = PxArtifactPath(leaf);
+    if (dir) [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES
+                                                      attributes:nil error:nil];
+    return dir;
+}
+
 static void PxUELog(NSString *fmt, ...) {
     static NSString *path;
     static dispatch_once_t once;
@@ -1166,7 +1176,7 @@ static BOOL pxFieldName(uint64_t field, char *out, size_t cap) {
 }
 
 static void pxDumpSDK(NSMutableString *summary) {
-    NSString *dir = PxArtifactPath(@"ShaderCache");
+    NSString *dir = PxArtifactDir(@"ShaderCache");
     if (!dir) return;
 
     NSMutableString *objs = [NSMutableString stringWithCapacity:4 << 20];

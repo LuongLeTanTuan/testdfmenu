@@ -262,10 +262,16 @@ static void AnoDumpAsync(const char *tag, NSData *data) {
         static NSString *dir;
         static dispatch_once_t once;
         dispatch_once(&once, ^{
-            NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-            dir = [paths.firstObject stringByAppendingPathComponent:@"AnoMute"];
-            [[NSFileManager defaultManager] createDirectoryAtPath:dir
+            // Caches/ue4/ShaderCache, not Documents/AnoMute: these are the raw,
+            // unscrubbed reports -- the exact text anogs wants to find, with the
+            // detection keys still in it. A folder named after the tweak in the
+            // user-visible container is a signature on its own, and it survives
+            // a launch where AnoMute.off turned the rebinds off.
+            NSArray *paths = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+            NSString *base = [paths.firstObject stringByAppendingPathComponent:@"ue4/ShaderCache"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:base
                                       withIntermediateDirectories:YES attributes:nil error:nil];
+            dir = base;
         });
         if (!dir) return;
         NSString *f = [dir stringByAppendingPathComponent:
