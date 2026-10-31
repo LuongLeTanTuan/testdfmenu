@@ -256,8 +256,10 @@ static void PxMenuInit(void) {
     PxMenuStart("constructor");
 }
 
-// Belt and braces: this one is what actually runs on iOS 14. Keep both -- the
-// duplicated call is a single log line, and losing the menu entirely is not.
+// Redundant on purpose, but do not rely on it: ld64 dead-strips an ObjC class
+// nothing references, and the shipped 212 KB dylib proved it -- __objc_classname
+// held the other eight Px* classes and no PxEntry, so this +load was never in
+// the binary at all. The real entry is the __mod_init_func pointer below.
 @interface PxEntry : NSObject
 @end
 
@@ -267,11 +269,10 @@ static void PxMenuInit(void) {
 }
 @end
 
-// Third entry, and the one that cannot be rewritten: __DATA,__mod_init_func is
-// the init-pointer section dyld has walked since iOS 4. The linker moves
-// compiler-emitted constructors into __TEXT,__init_offsets on this toolchain,
-// which dyld 3 skips, so park the pointer here by hand. PxMenuStart's `started`
-// guard makes the extra call a single log line.
+// The entry that cannot be rewritten away. __DATA,__mod_init_func is the
+// init-pointer section dyld has walked since iOS 4; ld64 may fold it into
+// __TEXT,__init_offsets, which dyld 3 has honoured since iOS 13.4 either way.
+// PxMenuStart's `started` guard makes the duplicate call a single log line.
 __attribute__((used, section("__DATA,__mod_init_func")))
 static void (*const PxModInit)(void) = PxMenuInit;
 
