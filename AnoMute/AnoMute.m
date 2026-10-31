@@ -13,8 +13,38 @@
 #import <mach-o/nlist.h>
 #import <mach/mach.h>
 #import <dlfcn.h>
+#import <stdarg.h>
 #import <string.h>
 #import <stdlib.h>
+
+#pragma mark - boot log
+
+// Same file PxMenu writes, so one log answers both questions: did our code run,
+// and did the report rebind happen before the process died.
+static void AnoLog(NSString *fmt, ...) {
+    static NSString *path;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        path = docs ? [docs stringByAppendingPathComponent:@"PxBoot.log"] : nil;
+    });
+    if (!path) return;
+
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSData *data = [[NSString stringWithFormat:@"[AnoMute] %@\n", msg] dataUsingEncoding:NSUTF8StringEncoding];
+
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [[NSFileManager defaultManager] createFileAtPath:path contents:data attributes:nil];
+        return;
+    }
+    @try { [fh seekToEndOfFile]; [fh writeData:data]; }
+    @catch (NSException *e) { }
+    [fh closeFile];
+}
 
 #pragma mark - report buffer
 
@@ -209,14 +239,22 @@ static int AnoIoctl(int cmd, void *a, void *b, void *c) {
 
 #pragma mark - install
 
-static void AnoInstall(void) {
+static void AnoInstall(NSInteger attempt) {
     // dlsym on RTLD_DEFAULT, not the saved slot value: a lazy slot still holds
     // __stub_helper until first call, and calling that would be fatal.
     gOrigGetReport = dlsym(RTLD_DEFAULT, "AnoSDKGetReportData");
     gOrigIoctl     = dlsym(RTLD_DEFAULT, "AnoSDKIoctl");
 
     if (!gOrigGetReport) {
-        NSLog(@"[AnoMute] anogs not mapped yet, retry");
+        // anogs is dlopen'd by the host, and the order is not guaranteed. The
+        // old code gave up after one look and silently never muted anything.
+        AnoLog(@"anogs not mapped yet (attempt %ld)", (long)attempt);
+        if (attempt < 20) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                AnoInstall(attempt + 1);
+            });
+        }
         return;
     }
 
@@ -229,15 +267,16 @@ static void AnoInstall(void) {
     if (gOrigIoctl)
         any |= AnoRebindEverywhere("_AnoSDKIoctl", (void *)AnoIoctl, NULL);
 
-    NSLog(@"[AnoMute] rebind %s (orig %p)", any ? "OK" : "MISSED", gOrigGetReport);
+    AnoLog(@"rebind %s (orig %p) after %ld attempt(s)", any ? "OK" : "MISSED", gOrigGetReport, (long)attempt);
 }
 
 __attribute__((constructor))
 static void AnoMuteEntry(void) {
-    // anogs init runs from the host's +load/init chain; 3 s is after that and
-    // before the first heartbeat on every build observed so far.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3ULL * NSEC_PER_SEC),
+    // 0.5 s: after the host's +load chain has had a chance to dlopen anogs, and
+    // early enough to matter -- the old 3 s start was after the reported crash.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        AnoInstall();
+        AnoLog(@"install start");
+        AnoInstall(0);
     });
 }

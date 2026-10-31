@@ -11,6 +11,12 @@
 // Wait for a key window, install, and re-assert on foreground.
 static NSInteger const kPxMaxInstallAttempts = 120;   // 120 * 0.25s = 30s
 
+// Nothing but the heartbeat runs for the first five seconds. The reported crash
+// lands around 1.5 s; if it is the host's integrity sweep, installing late gets
+// past it, and if it is our own code, the heartbeat proves we were alive until
+// then and the kill came from outside.
+static const double kPxInstallDelay = 5.0;
+
 // Documents/PxBoot.log survives a SIGKILL, so it is the only way to tell "our
 // code threw" apart from "the anti-cheat killed the process". Every step writes
 // before it runs; the last line in the file is where it died.
@@ -60,6 +66,20 @@ static NSString *PxMarkerPath(void) {
         path = docs ? [docs stringByAppendingPathComponent:@"PxBoot.inprogress"] : nil;
     });
     return path;
+}
+
+// Proves the process is still alive between install steps. A log that stops on a
+// heartbeat with no exception above it means something outside this dylib killed
+// the app, which no amount of local hardening can fix.
+static void PxHeartbeat(NSInteger tick, NSInteger total) {
+    if (tick == 0 || tick % 4 == 0) {
+        PxLog(@"heartbeat %ld/%ld images=%u", (long)tick, (long)total, (unsigned)_dyld_image_count());
+    }
+    if (tick >= total) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        PxHeartbeat(tick + 1, total);
+    });
 }
 
 // Cosmetic problems in the menu must never abort the host app. This used to be
@@ -170,8 +190,11 @@ static void PxMenuInit(void) {
         return;
     }
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+    PxHeartbeat(0, 24);   // 24 * 0.25s = 6s, past the reported crash
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kPxInstallDelay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        PxLog(@"install delay elapsed");
         @try {
             PxObserveForeground();
             PxLog(@"foreground observer registered");
