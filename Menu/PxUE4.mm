@@ -32,6 +32,7 @@ enum {
 
 static uint32_t g_classOff    = 0x10; // UObject::ClassPrivate   (calibrated)
 static uint32_t g_nameOff     = 0x18; // UObject::NamePrivate    (calibrated)
+static uint32_t g_outerOff    = 0x20; // UObject::OuterPrivate   (follows nameOff)
 static uint32_t g_nameStride  = 1;    // bytes per name-pool index unit
 static uint32_t g_nameShift   = 16;   // entries per name block = 1 << shift
 static uint32_t g_chunkShift  = 16;   // objects per FUObjectItem chunk
@@ -295,9 +296,16 @@ static BOOL pxClassNameOf(uint64_t obj, char *out, size_t cap) {
     return pxNameOf(cls, out, cap);
 }
 
+// The build that ships this game drops the UObject vtable and keeps Class at
+// +0x08 / Name at +0x1C / Outer at +0x10 (stock 4.2x: +0x10 / +0x18 / +0x20).
+// Outer never sits at name+8 on both, so the pair is picked together.
+static uint32_t pxOuterFor(uint32_t nameOff) {
+    return (nameOff == 0x1C) ? 0x10 : 0x20;
+}
+
 static inline uint64_t pxOuterOf(uint64_t obj) {
     uint64_t outer = 0;
-    if (!pxRd64(obj + g_nameOff + 8, &outer)) return 0;
+    if (!pxRd64(obj + g_outerOff, &outer)) return 0;
     return outer;
 }
 
@@ -465,11 +473,11 @@ static BOOL pxFindObjectArray(void) {
         // Stock TUObjectArray keeps the counts after the chunk list; the
         // shipped cheat reads them before it. Prefer the first that probes
         // clean and keep the other as a calibration fallback.
-        static const int32_t kMaxDelta[] = { 8, -0xC };
-        static const int32_t kNumDelta[] = { 12, -8 };
+        static const int32_t kMaxDelta[] = { 0x10, 8, -0xC };
+        static const int32_t kNumDelta[] = { 0x14, 12, -8 };
         int picked = -1;
         g_arrHasAlt = NO;
-        for (int v2 = 0; v2 < 2; v2++) {
+        for (int v2 = 0; v2 < 3; v2++) {
             uint32_t num = 0;
             g_objProbes++;
             if (!pxProbeObjectArray(p, kMaxDelta[v2], kNumDelta[v2], &num)) continue;
@@ -564,10 +572,14 @@ static int pxScoreTuple(uint32_t classOff, uint32_t nameOff, uint32_t stride,
 static BOOL pxCalibrate(void) {
     if (!g_objArray || !g_nameBlocks) return NO;
 
-    static const uint32_t kClass[]  = { 0x10, 0x08 };
-    static const uint32_t kName[]   = { 0x18, 0x1C };
-    static const uint32_t kStride[] = { 1, 2 };
-    static const uint32_t kShift[]  = { 16, 17 };
+    // Order matters: ties keep the first candidate, and the public dump of this
+    // exact game (Android, same content) reports Class +0x08 / Name +0x1C /
+    // name stride 2 / 1<<18 entries per block. Those go first so a tie lands on
+    // the layout the shipped build actually uses instead of a stock guess.
+    static const uint32_t kClass[]  = { 0x08, 0x10 };
+    static const uint32_t kName[]   = { 0x1C, 0x18 };
+    static const uint32_t kStride[] = { 2, 1 };
+    static const uint32_t kShift[]  = { 18, 16, 17, 14, 13 };
     static const uint32_t kChunk[]  = { 16, 17 };
 
     int best = 0;
@@ -577,7 +589,7 @@ static BOOL pxCalibrate(void) {
     for (int a = 0; a < 2; a++)
     for (int b = 0; b < 2; b++)
     for (int c = 0; c < 2; c++)
-    for (int d = 0; d < 2; d++)
+    for (int d = 0; d < 5; d++)
     for (int e = 0; e < 2; e++) {
         int sc = pxScoreTuple(kClass[a], kName[b], kStride[c], kShift[d], kChunk[e]);
         if (sc > best) {
@@ -589,6 +601,7 @@ static BOOL pxCalibrate(void) {
 
     g_classOff = bClass;
     g_nameOff = bName;
+    g_outerOff = pxOuterFor(bName);
     g_nameStride = bStride;
     g_nameShift = bShift;
     g_chunkShift = bChunk;
@@ -782,6 +795,97 @@ static dispatch_queue_t pxScanQueue(void) {
     return q;
 }
 
+// -------------------------------------------------------------------- dump --
+// A live SDK dump, written by the process itself. No jailbreak, no external
+// tool: once the object array and name pool resolve, everything the game knows
+// about its own classes is reachable. Struct offsets below come from the public
+// AndUEDumper output for this exact game (same content, same UE branch).
+enum {
+    kStructSuper      = 0x40,   // UStruct::SuperStruct
+    kStructChildProps = 0x68,   // UStruct::ChildProperties (FField chain)
+    kFieldNext        = 0x18,   // FField::Next
+    kFieldName        = 0x28,   // FField::NamePrivate (FName)
+    kPropArrayDim     = 0x38,
+    kPropElemSize     = 0x3C,
+    kPropFlags        = 0x40,
+    kPropOffset       = 0x4C,
+};
+
+static BOOL pxFieldName(uint64_t field, char *out, size_t cap) {
+    uint32_t idx = 0;
+    if (!pxRd32(field + kFieldName, &idx)) return NO;
+    return pxNameAt(idx, out, cap);
+}
+
+static void pxDumpSDK(NSMutableString *summary) {
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    if (!docs) return;
+    NSString *dir = [docs stringByAppendingPathComponent:@"DUMP"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES
+                                                   attributes:nil error:nil];
+
+    NSMutableString *objs = [NSMutableString stringWithCapacity:4 << 20];
+    [objs appendString:@"idx\tclass\tname\touter\taddr\n"];
+    uint32_t idx = 0;
+    pxForEachObject([&](uint64_t obj) {
+        if (idx >= 250000) return;
+        char cls[128] = { 0 }, nm[128] = { 0 }, onm[128] = { 0 };
+        pxClassNameOf(obj, cls, sizeof(cls));
+        pxNameOf(obj, nm, sizeof(nm));
+        uint64_t outer = pxOuterOf(obj);
+        if (outer) pxNameOf(outer, onm, sizeof(onm));
+        [objs appendFormat:@"%u\t%s\t%s\t%s\t0x%llX\n", idx++, cls, nm, onm, obj];
+    });
+    [objs writeToFile:[dir stringByAppendingPathComponent:@"Objects.txt"]
+           atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    NSMutableString *cls = [NSMutableString stringWithCapacity:8 << 20];
+    uint32_t classes = 0, props = 0;
+    pxForEachObject([&](uint64_t obj) {
+        if (classes >= 30000) return;
+        char cname[128] = { 0 };
+        if (!pxClassNameOf(obj, cname, sizeof(cname))) return;
+        if (strcmp(cname, "Class") != 0) return;
+
+        char nm[128] = { 0 }, sup[128] = { 0 };
+        if (!pxNameOf(obj, nm, sizeof(nm))) return;
+        uint64_t super = 0;
+        if (pxRd64(obj + kStructSuper, &super) && super) pxNameOf(super, sup, sizeof(sup));
+
+        [cls appendFormat:@"class %s : %s\n", nm, sup[0] ? sup : "?"];
+        classes++;
+
+        uint64_t field = 0;
+        if (!pxRd64(obj + kStructChildProps, &field)) { [cls appendString:@"\n"]; return; }
+        for (int i = 0; i < 400 && field; i++) {
+            char fname[128] = { 0 };
+            uint32_t off = 0, dim = 0, elem = 0, flags = 0;
+            BOOL ok = pxFieldName(field, fname, sizeof(fname)) &&
+                      pxRd32(field + kPropOffset, &off) &&
+                      pxRd32(field + kPropArrayDim, &dim) &&
+                      pxRd32(field + kPropElemSize, &elem) &&
+                      pxRd32(field + kPropFlags, &flags);
+            if (ok) {
+                [cls appendFormat:@"  0x%04X  %-40s dim=%u elem=%u flags=0x%08X\n",
+                    off, fname, dim, elem, flags];
+                props++;
+            }
+            uint64_t next = 0;
+            if (!pxRd64(field + kFieldNext, &next)) break;
+            if (next == field) break;
+            field = next;
+        }
+        [cls appendString:@"\n"];
+    });
+    [cls writeToFile:[dir stringByAppendingPathComponent:@"Classes.txt"]
+          atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    if (summary) {
+        [summary appendFormat:@"dump           %u objects, %u classes, %u properties -> %@\n",
+            idx, classes, props, dir];
+    }
+}
+
 // ------------------------------------------------------------------- API --
 @implementation PxUE4
 
@@ -806,6 +910,7 @@ static dispatch_queue_t pxScanQueue(void) {
     g_arrHasAlt = NO;
     g_classOff = 0x10;
     g_nameOff = 0x18;
+    g_outerOff = 0x20;
     g_nameStride = 1;
     g_nameShift = 16;
     g_chunkShift = 16;
@@ -1306,6 +1411,8 @@ static uint64_t pxLocalPawn(PxVec3 camLoc) {
         }
         [s appendFormat:@"  total %lu\n", (unsigned long)g_actors.count];
     }
+
+    if (g_objArray && g_nameBlocks && g_layoutOK) pxDumpSDK(s);
 
     NSString *documents = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     if (documents) {
