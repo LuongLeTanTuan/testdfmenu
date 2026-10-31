@@ -63,10 +63,13 @@ static inline PxVec3 pxCross(PxVec3 a, PxVec3 b) {
 #define PX_MAX_RANGES 8192
 static uint64_t g_rangeLo[PX_MAX_RANGES];
 static uint64_t g_rangeHi[PX_MAX_RANGES];
+static uint8_t  g_rangeW[PX_MAX_RANGES];    // VM_PROT_WRITE
 static int      g_rangeCount;
+static int      g_hitRegion = -1;           // last region that answered a hit
 
 static void pxBuildRanges(void) {
     g_rangeCount = 0;
+    g_hitRegion = -1;
     // vm_region_recurse_64, not mach_vm_region_recurse: the mach_vm header is a
     // deliberate #error on iOS and the 64-bit vm API is the one exported there.
     vm_address_t addr = 0;
@@ -81,10 +84,17 @@ static void pxBuildRanges(void) {
         if (!info.is_submap && (info.protection & VM_PROT_READ)) {
             g_rangeLo[g_rangeCount] = addr;
             g_rangeHi[g_rangeCount] = addr + size;
+            g_rangeW[g_rangeCount] = (info.protection & VM_PROT_WRITE) ? 1 : 0;
             g_rangeCount++;
         }
         addr += size;
     }
+}
+
+static int pxWritableCount(void) {
+    int n = 0;
+    for (int i = 0; i < g_rangeCount; i++) if (g_rangeW[i]) n++;
+    return n;
 }
 
 static inline BOOL pxIn(uint64_t a, size_t len) {
@@ -98,21 +108,41 @@ static inline BOOL pxIn(uint64_t a, size_t len) {
     return NO;
 }
 
+// The scanners walk pointer-dense structures: consecutive candidates usually
+// land in the same region, so remembering the last hit turns the common case
+// into two compares instead of a ten-step binary search.
+static inline BOOL pxInFast(uint64_t a, size_t len) {
+    int c = g_hitRegion;
+    if (c >= 0 && a >= g_rangeLo[c] && a + len <= g_rangeHi[c]) return YES;
+    int lo = 0, hi = g_rangeCount - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        if (a < g_rangeLo[mid]) hi = mid - 1;
+        else if (a >= g_rangeHi[mid]) lo = mid + 1;
+        else {
+            if (a + len > g_rangeHi[mid]) return NO;
+            g_hitRegion = mid;
+            return YES;
+        }
+    }
+    return NO;
+}
+
 static inline BOOL pxRd64(uint64_t a, uint64_t *out) {
     if (a & 7) return NO;
-    if (!pxIn(a, 8)) return NO;
+    if (!pxInFast(a, 8)) return NO;
     *out = *(volatile uint64_t *)a;
     return YES;
 }
 static inline BOOL pxRd32(uint64_t a, uint32_t *out) {
     if (a & 3) return NO;
-    if (!pxIn(a, 4)) return NO;
+    if (!pxInFast(a, 4)) return NO;
     *out = *(volatile uint32_t *)a;
     return YES;
 }
 static inline BOOL pxRd16(uint64_t a, uint16_t *out) {
     if (a & 1) return NO;
-    if (!pxIn(a, 2)) return NO;
+    if (!pxInFast(a, 2)) return NO;
     *out = *(volatile uint16_t *)a;
     return YES;
 }
@@ -174,6 +204,12 @@ static BOOL pxInHostCode(uint64_t a, size_t len) {
     return NO;
 }
 
+static BOOL pxInHostData(uint64_t a, size_t len) {
+    for (int i = 0; i < g_dataCount; i++)
+        if (a >= g_data[i].lo && a + len <= g_data[i].hi) return YES;
+    return NO;
+}
+
 // ---------------------------------------------------------------- globals --
 static uint64_t g_nameBlocks;   // &FNameEntryAllocator::Blocks[0]
 static uint64_t g_objArray;     // &TUObjectArray::Objects
@@ -207,6 +243,8 @@ static NSString *g_status = @"not scanned";
 static CFTimeInterval g_lastActorScan;
 static CFTimeInterval g_lastScan;
 static int g_scanAttempts;
+static BOOL g_scanning;
+static BOOL g_published;   // the one flag the main thread may trust
 
 // ------------------------------------------------------------ name lookup --
 static BOOL pxNameAt(uint32_t index, char *out, size_t cap) {
@@ -311,38 +349,74 @@ static uint32_t pxForEachObject(F body) {
 }
 
 // --------------------------------------------------------------- discovery --
-static BOOL pxFindNamePool(void) {
-    const uint8_t kNone[8] = { 0x08, 0x00, 'N', 'o', 'n', 'e', 0x00, 0x00 };
+// GNames and GObjects are heap-backed here: the block pointer array, the chunk
+// list and the objects themselves are all malloc'd. Scanning the host's
+// __DATA segment therefore finds nothing, which is what the first build did.
+// Walk writable VM instead, host data first (a hit there is cheap), and cap the
+// total so a bad guess can't stall the scan thread for seconds.
+#define PX_SCAN_CAP (768ull << 20)
 
-    for (int s = 0; s < g_dataCount; s++) {
-        uint64_t p = g_data[s].lo;
-        uint64_t end = g_data[s].hi;
-        for (; p + 8 <= end; p += 8) {
-            uint64_t v = *(volatile uint64_t *)p;
-            if (v < 0x10000 || v > 0x00007FFFFFFFFFFFULL) continue;
-            if (v & 7) continue;
-            if (!pxIn(v, 8)) continue;
+static uint64_t g_scanBytes;
+static double   g_scanMs;
+static int      g_nameHits;
+static int      g_objHits;
+static int      g_objProbes;
 
-            const uint8_t *b = (const uint8_t *)v;
-            if (memcmp(b, kNone, 6) != 0) continue;
+template <typename F>
+static void pxScanWritable(F body) {
+    uint64_t budget = PX_SCAN_CAP;
+    uint64_t bytes = 0;
+    double t0 = CACurrentMediaTime();
 
-            // Blocks[0] found. Validate the next few slots look like a pool.
-            int good = 0;
-            for (int k = 1; k <= 4; k++) {
-                uint64_t nb = 0;
-                if (!pxRd64(p + (uint64_t)k * 8, &nb)) break;
-                if (nb == 0) { good++; continue; }
-                if (pxIn(nb, 16)) good++;
-            }
-            if (good < 1) continue;
+    for (int pass = 0; pass < 2 && bytes < budget; pass++) {
+        for (int i = 0; i < g_rangeCount && bytes < budget; i++) {
+            if (!g_rangeW[i]) continue;
+            BOOL inHost = pxInHostData(g_rangeLo[i], 1);
+            if ((pass == 0) != inHost) continue;
 
-            g_nameBlocks = p;
-            char tmp[16];
-            if (pxNameAt(0, tmp, sizeof(tmp)) && strcmp(tmp, "None") == 0) return YES;
-            g_nameBlocks = 0;
+            uint64_t p = g_rangeLo[i];
+            uint64_t end = g_rangeHi[i];
+            uint64_t room = budget - bytes;
+            if (end - p > room) end = p + room;
+            for (; p + 8 <= end; p += 8) body(p, *(volatile uint64_t *)p);
+            bytes += end - g_rangeLo[i];
         }
     }
-    return NO;
+    g_scanBytes = bytes;
+    g_scanMs = (CACurrentMediaTime() - t0) * 1000.0;
+}
+
+static BOOL pxFindNamePool(void) {
+    const uint8_t kNone[8] = { 0x08, 0x00, 'N', 'o', 'n', 'e', 0x00, 0x00 };
+    BOOL found = NO;
+    g_nameHits = 0;
+
+    pxScanWritable([&](uint64_t p, uint64_t v) {
+        if (found) return;
+        if (v < 0x10000 || v > 0x00007FFFFFFFFFFFULL) return;
+        if (v & 7) return;
+        if (!pxInFast(v, 8)) return;
+
+        const uint8_t *b = (const uint8_t *)v;
+        if (memcmp(b, kNone, 6) != 0) return;
+        g_nameHits++;
+
+        // Blocks[0] found. Validate the next few slots look like a pool.
+        int good = 0;
+        for (int k = 1; k <= 4; k++) {
+            uint64_t nb = 0;
+            if (!pxRd64(p + (uint64_t)k * 8, &nb)) break;
+            if (nb == 0) { good++; continue; }
+            if (pxIn(nb, 16)) good++;
+        }
+        if (good < 1) return;
+
+        g_nameBlocks = p;
+        char tmp[16];
+        if (pxNameAt(0, tmp, sizeof(tmp)) && strcmp(tmp, "None") == 0) { found = YES; return; }
+        g_nameBlocks = 0;
+    });
+    return found;
 }
 
 static BOOL pxProbeObjectArray(uint64_t slot, int32_t maxDelta, int32_t numDelta,
@@ -378,41 +452,42 @@ static BOOL pxProbeObjectArray(uint64_t slot, int32_t maxDelta, int32_t numDelta
 }
 
 static BOOL pxFindObjectArray(void) {
-    for (int s = 0; s < g_dataCount; s++) {
-        uint64_t p = g_data[s].lo;
-        uint64_t end = g_data[s].hi;
-        for (; p + 16 <= end; p += 8) {
-            uint64_t v = *(volatile uint64_t *)p;
-            if (v < 0x10000 || v > 0x00007FFFFFFFFFFFULL) continue;
-            if (v & 7) continue;
-            if (!pxIn(v, 8)) continue;
+    BOOL found = NO;
+    g_objHits = 0;
+    g_objProbes = 0;
 
-            // Stock TUObjectArray keeps the counts after the chunk list; the
-            // shipped cheat reads them before it. Prefer the first that probes
-            // clean and keep the other as a calibration fallback.
-            static const int32_t kMaxDelta[] = { 8, -0xC };
-            static const int32_t kNumDelta[] = { 12, -8 };
-            int picked = -1;
-            g_arrHasAlt = NO;
-            for (int v2 = 0; v2 < 2; v2++) {
-                uint32_t num = 0;
-                if (!pxProbeObjectArray(p, kMaxDelta[v2], kNumDelta[v2], &num)) continue;
-                if (picked < 0) {
-                    picked = v2;
-                    g_objArray = p;
-                    g_arrMaxDelta = kMaxDelta[v2];
-                    g_arrNumDelta = kNumDelta[v2];
-                    g_objCount = num;
-                } else {
-                    g_altMaxDelta = kMaxDelta[v2];
-                    g_altNumDelta = kNumDelta[v2];
-                    g_arrHasAlt = YES;
-                }
+    pxScanWritable([&](uint64_t p, uint64_t v) {
+        if (found) return;
+        if (v < 0x10000 || v > 0x00007FFFFFFFFFFFULL) return;
+        if (v & 7) return;
+        if (!pxInFast(v, 8)) return;
+
+        // Stock TUObjectArray keeps the counts after the chunk list; the
+        // shipped cheat reads them before it. Prefer the first that probes
+        // clean and keep the other as a calibration fallback.
+        static const int32_t kMaxDelta[] = { 8, -0xC };
+        static const int32_t kNumDelta[] = { 12, -8 };
+        int picked = -1;
+        g_arrHasAlt = NO;
+        for (int v2 = 0; v2 < 2; v2++) {
+            uint32_t num = 0;
+            g_objProbes++;
+            if (!pxProbeObjectArray(p, kMaxDelta[v2], kNumDelta[v2], &num)) continue;
+            if (picked < 0) {
+                picked = v2;
+                g_objArray = p;
+                g_arrMaxDelta = kMaxDelta[v2];
+                g_arrNumDelta = kNumDelta[v2];
+                g_objCount = num;
+            } else {
+                g_altMaxDelta = kMaxDelta[v2];
+                g_altNumDelta = kNumDelta[v2];
+                g_arrHasAlt = YES;
             }
-            if (picked >= 0) return YES;
         }
-    }
-    return NO;
+        if (picked >= 0) { g_objHits++; found = YES; }
+    });
+    return found;
 }
 
 // ------------------------------------------------------------- calibration --
@@ -665,6 +740,48 @@ static void pxCameraBasis(float pitchDeg, float yawDeg, PxVec3 *fwd, PxVec3 *rig
     *up = u;
 }
 
+// A failed scan leaves a line in PxBoot.log next to the boot markers, so one
+// log answers "did discovery run, how much did it walk, what did it hit".
+static void PxUELog(NSString *fmt, ...) {
+    static NSString *path;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        path = docs ? [docs stringByAppendingPathComponent:@"PxBoot.log"] : nil;
+    });
+    if (!path) return;
+
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+
+    NSString *line = [NSString stringWithFormat:@"[%9.3f] [ue4] %@\n", CACurrentMediaTime(), msg];
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path]) { [data writeToFile:path atomically:NO]; return; }
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) return;
+    @try { [fh seekToEndOfFile]; [fh writeData:data]; }
+    @catch (NSException *e) { }
+    [fh closeFile];
+}
+
+// g_status is read from the main thread; assign it there.
+static void pxSetStatus(NSString *s) {
+    dispatch_async(dispatch_get_main_queue(), ^{ g_status = s; });
+}
+
+static dispatch_queue_t pxScanQueue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("px.ue4.scan", DISPATCH_QUEUE_SERIAL);
+        dispatch_set_target_queue(q, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    });
+    return q;
+}
+
 // ------------------------------------------------------------------- API --
 @implementation PxUE4
 
@@ -676,7 +793,7 @@ static void pxCameraBasis(float pitchDeg, float yawDeg, PxVec3 *fwd, PxVec3 *rig
 }
 
 - (BOOL)ready {
-    return g_layoutOK && g_objArray && g_nameBlocks && g_peIndex && g_fnActorLoc;
+    return g_published;
 }
 
 - (void)invalidate {
@@ -704,25 +821,49 @@ static void pxCameraBasis(float pitchDeg, float yawDeg, PxVec3 *fwd, PxVec3 *rig
     [g_actors removeAllObjects];
     g_lastActorScan = 0;
     g_scanAttempts = 0;
+    g_published = NO;
     g_status = @"reset";
 }
 
 - (void)scanIfNeeded {
-    if (self.ready) return;
-    if (g_scanAttempts > 6) return;
+    if (self.ready || g_scanning) return;
+    // A full pass walks every writable page; 60 attempts covers a slow boot
+    // without hammering the device forever if the layout never shows up.
+    if (g_scanAttempts > 60) return;
 
-    // Each attempt walks the whole host __DATA; keep it off the render path.
     CFTimeInterval now = CACurrentMediaTime();
-    if (now - g_lastScan < 1.5) return;
+    // Back off after the first few attempts: a pass costs a second of CPU and a
+    // retry every 1.5 s forever would just burn the device.
+    double gap = g_scanAttempts < 8 ? 1.5 : 5.0;
+    if (now - g_lastScan < gap) return;
     g_lastScan = now;
     g_scanAttempts++;
 
-    if (g_rangeCount == 0) pxBuildRanges();
-    if (!g_imgBase && !pxLoadHostImage()) { g_status = @"host image not found"; return; }
-    if (g_rangeCount == 0) pxBuildRanges();
+    // Discovery is pure reads, but a pass can take a second on a cold heap and
+    // the render loop must not wait on it.
+    g_scanning = YES;
+    dispatch_async(pxScanQueue(), ^{
+        [self scanOnce];
+        g_scanning = NO;
+    });
+}
 
-    if (!g_nameBlocks && !pxFindNamePool()) { g_status = @"GNames not found"; return; }
-    if (!g_objArray && !pxFindObjectArray()) { g_status = @"GObjects not found"; return; }
+- (void)scanOnce {
+    pxBuildRanges();                 // the heap grows between attempts
+    if (!g_imgBase && !pxLoadHostImage()) { pxSetStatus(@"host image not found"); return; }
+
+    if (!g_nameBlocks && !pxFindNamePool()) {
+        pxSetStatus(@"GNames not found");
+        PxUELog(@"GNames miss: %d candidate pointers, %.1f MB in %.0f ms",
+                g_nameHits, g_scanBytes / 1048576.0, g_scanMs);
+        return;
+    }
+    if (!g_objArray && !pxFindObjectArray()) {
+        pxSetStatus(@"GObjects not found");
+        PxUELog(@"GObjects miss: %d hits, %d probes, %.1f MB in %.0f ms",
+                g_objHits, g_objProbes, g_scanBytes / 1048576.0, g_scanMs);
+        return;
+    }
     if (!g_layoutOK && !pxCalibrate()) {
         // The array matched both count layouts structurally; try the other one
         // before giving up.
@@ -741,10 +882,12 @@ static void pxCameraBasis(float pitchDeg, float yawDeg, PxVec3 *fwd, PxVec3 *rig
         }
     }
     if (!g_layoutOK) {
-        g_status = [NSString stringWithFormat:@"layout calibration failed (score %llu)", g_layoutScore];
+        pxSetStatus([NSString stringWithFormat:@"layout calibration failed (score %llu)", g_layoutScore]);
+        PxUELog(@"layout calibration failed: gnames=0x%llX gobjects=0x%llX count=0x%X score=%llu",
+                g_nameBlocks, g_objArray, g_objCount, g_layoutScore);
         return;
     }
-    if (!g_peIndex && !pxFindProcessEvent()) { g_status = @"ProcessEvent index not found"; return; }
+    if (!g_peIndex && !pxFindProcessEvent()) { pxSetStatus(@"ProcessEvent index not found"); return; }
 
     if (!g_classGPChar)  g_classGPChar = pxFindClass("GPCharacterBase");
     if (!g_classCamMgr)  g_classCamMgr = pxFindClass("PlayerCameraManager");
@@ -789,7 +932,13 @@ static void pxCameraBasis(float pitchDeg, float yawDeg, PxVec3 *fwd, PxVec3 *rig
     [s appendFormat:@" charClasses=%lu", (unsigned long)g_charClasses.count];
     [s appendFormat:@" fn[loc=%llX cam=%llX/%llX team=%llX hp=%llX/%llX]",
         g_fnActorLoc, g_fnCamLoc, g_fnCamRot, g_fnTeammate, g_fnHealth, g_fnHealthMax];
-    g_status = s;
+    pxSetStatus(s);
+
+    // Publish point: ready is the last flag set, and the fence keeps the rest of
+    // the discovery visible to the thread that starts reading right after it.
+    __sync_synchronize();
+    g_published = YES;
+    PxUELog(@"ready: %@", s);
 }
 
 static void pxRefreshActors(void) {
@@ -1098,7 +1247,10 @@ static uint64_t pxLocalPawn(PxVec3 camLoc) {
 
     [s appendString:@"== host ==\n"];
     [s appendFormat:@"image      0x%llX slide 0x%llX\n", g_imgBase, g_imgSlide];
-    [s appendFormat:@"data segs %d, code segs %d, ranges %d\n", g_dataCount, g_codeCount, g_rangeCount];
+    [s appendFormat:@"data segs %d, code segs %d, ranges %d (writable %d)\n",
+        g_dataCount, g_codeCount, g_rangeCount, pxWritableCount()];
+    [s appendFormat:@"scan        %.1f MB in %.0f ms, attempts %d, nameHits %d, objProbes %d\n",
+        g_scanBytes / 1048576.0, g_scanMs, g_scanAttempts, g_nameHits, g_objProbes];
     [s appendString:@"\n== discovered ==\n"];
     [s appendFormat:@"GNames blocks  0x%llX\n", g_nameBlocks];
     [s appendFormat:@"GObjects slot  0x%llX count 0x%X\n", g_objArray, g_objCount];
