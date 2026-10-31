@@ -180,14 +180,39 @@ def main():
         pass
     print('  CD blob      : %d B, first 8 %s' % (len(cd_blob), cd_blob[:8].hex()))
 
-    # do our own hooks survive signing?
-    name, vmaddr, vmsize, fileoff, filesize = [s for s in segs if s[0] == '__PXLOAD'][0]
+    # do our hooks survive signing?
+    px = [s for s in segs if s[0] == '__PXLOAD']
     print()
     print('== payload ==')
-    print('  __PXLOAD     : vm %#x file %#x + %#x' % (vmaddr, fileoff, filesize))
-    print('  dylib bytes  : %s' % (b'PxMenu' in d[fileoff:fileoff + 0x40000]))
-    stub = d[main_cmd[0]:main_cmd[0] + 8]
-    print('  stub at entry: %s' % stub.hex())
+    if px:
+        name, vmaddr, vmsize, fileoff, filesize = px[0]
+        print('  __PXLOAD     : vm %#x file %#x + %#x' % (vmaddr, fileoff, filesize))
+        print('  dylib bytes  : %s' % (b'PxMenu' in d[fileoff:fileoff + 0x40000]))
+    else:
+        print('  __PXLOAD     : none (dylibs are bundle files)')
+    print('  LC_MAIN      : %#x' % main_cmd[0])
+
+    for n in sorted(names):
+        if n.startswith(APP) and n.count('/') == APP.count('/') and n.endswith('.dylib'):
+            nd = z.read(n)
+            if struct.unpack_from('<I', nd, 0)[0] != 0xFEEDFACF:
+                print('  %-14s not a Mach-O' % n.split('/')[-1])
+                ok = False
+                continue
+            ncmds2 = struct.unpack_from('<I', nd, 16)[0]
+            o2 = 32
+            sig = None
+            for _ in range(ncmds2):
+                c, cs2 = struct.unpack_from('<II', nd, o2)
+                if c == 0x1D:
+                    sig = struct.unpack_from('<II', nd, o2 + 8)
+                o2 += cs2
+            tail = 'no signature' if not sig else '%s, ends %s' % (
+                'dataoff %#x size %#x' % sig,
+                'EOF' if sig[0] + sig[1] == len(nd) else 'NOT at EOF')
+            print('  %-14s %d B, %s' % (n.split('/')[-1], len(nd), tail))
+            if not sig or sig[0] + sig[1] != len(nd):
+                ok = False
 
     print()
     print('PASS' if ok else 'FAIL')
