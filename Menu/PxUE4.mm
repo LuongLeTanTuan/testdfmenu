@@ -1152,8 +1152,13 @@ static void pxDumpSDK(NSMutableString *summary) {
 
 - (void)scanOnce {
     // Statics only. Both globals come from decoding the ADRL pairs that reach
-    // them, so there is nothing to walk; every read is bounded to a handful of
-    // slots around an address the pattern already proved.
+    // them, so there is nothing to walk. The guarded readers still refuse any
+    // address outside the VM map, so the map has to be rebuilt first or every
+    // probe answers NO and discovery silently fails on a valid pointer.
+    pxBuildRanges();
+    PxUELog(@"scan enter img=0x%llX ranges=%d writable=%d",
+            g_imgBase, g_rangeCount, pxWritableCount());
+
     if (!g_imgBase && !pxLoadHostImage()) { pxSetStatus(@"host image not found"); return; }
 
     pxResolveStatics();

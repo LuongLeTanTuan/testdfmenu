@@ -68,6 +68,9 @@
 }
 
 - (void)tick:(CADisplayLink *)link {
+    static int firstTick;
+    if (!firstTick) { firstTick = 1; PxLogShared(@"overlay tick 1"); }
+
     self.tick++;
     if (![PxUE4 shared].ready) [[PxUE4 shared] scanIfNeeded];
 
