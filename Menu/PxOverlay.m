@@ -49,17 +49,16 @@
 
 - (void)setEnabled:(BOOL)enabled {
     _enabled = enabled;
-    if (enabled) {
-        if (!self.superview) [[self class] install];
-        if (!self.link) {
-            self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
-            // 20 Hz is enough for boxes; 60 Hz burns battery for nothing.
-            self.link.preferredFramesPerSecond = 20;
-            [self.link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-        }
-    } else {
-        [self.link invalidate];
-        self.link = nil;
+    if (!self.superview) [[self class] install];
+    // The timer drives both the box draw and the periodic skin re-apply. The
+    // skin has to work without the ESP window ever coming up, so the link
+    // starts on the first call and stays up for the life of the process; only
+    // the window visibility follows `enabled`.
+    if (!self.link) {
+        self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
+        // 20 Hz is enough for boxes; 60 Hz burns battery for nothing.
+        self.link.preferredFramesPerSecond = 20;
+        [self.link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     }
     // A transparent full-screen window still sits in the app's window list and
     // costs a hit-test pass on every touch; keep it out of the chain unless the

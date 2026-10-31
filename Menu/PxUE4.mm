@@ -386,75 +386,75 @@ static uint32_t pxForEachObject(F body) {
 }
 
 // --------------------------------------------------------------- discovery --
-// GNames and GObjects are heap-backed here: the block pointer array, the chunk
-// list and the objects themselves are all malloc'd. Scanning the host's
-// __DATA segment therefore finds nothing, which is what the first build did.
-// Walk writable VM instead, host data first (a hit there is cheap), and cap the
-// total so a bad guess can't stall the scan thread for seconds.
-#define PX_SCAN_CAP (768ull << 20)
+// Both globals are reached by decoding the ADRL pairs that reference them, so
+// discovery never needs to walk the heap. An earlier build scanned up to 768 MB
+// of writable VM looking for the pools by content; it never produced a single
+// hit on this binary and it is what killed the process the instant the ESP
+// switch started the scan. It is gone -- every read below is bounded to a few
+// dozen slots around an address the pattern already proved.
 
-static uint64_t g_scanBytes;
-static double   g_scanMs;
-static int      g_nameHits;
-static int      g_objHits;
-static int      g_objProbes;
+static BOOL g_dumped;
 
-template <typename F>
-static void pxScanWritable(F body) {
-    uint64_t budget = PX_SCAN_CAP;
-    uint64_t bytes = 0;
-    double t0 = CACurrentMediaTime();
-
-    for (int pass = 0; pass < 2 && bytes < budget; pass++) {
-        for (int i = 0; i < g_rangeCount && bytes < budget; i++) {
-            if (!g_rangeW[i]) continue;
-            BOOL inHost = pxInHostData(g_rangeLo[i], 1);
-            if ((pass == 0) != inHost) continue;
-
-            uint64_t p = g_rangeLo[i];
-            uint64_t end = g_rangeHi[i];
-            uint64_t room = budget - bytes;
-            if (end - p > room) end = p + room;
-            for (; p + 8 <= end; p += 8) body(p, *(volatile uint64_t *)p);
-            bytes += end - g_rangeLo[i];
-        }
-    }
-    g_scanBytes = bytes;
-    g_scanMs = (CACurrentMediaTime() - t0) * 1000.0;
+// What a candidate pool slot points at, in words we can act on.
+static const char *pxNameHint(uint64_t v) {
+    if (!v || (v & 7) || !pxInFast(v, 8)) return "";
+    uint16_t hdr = 0;
+    if (!pxRd16(v, &hdr)) return "";
+    if (hdr & 1) return "";              // wide entry, not index 0
+    uint32_t len = hdr >> 1;
+    if (len < 4 || len > 40) return "";
+    uint64_t str = v + 2;
+    if (!pxIn(str, len)) return "";
+    char raw[48];
+    memset(raw, 0, sizeof(raw));
+    memcpy(raw, (const void *)str, MIN((size_t)len, sizeof(raw) - 1));
+    if (strcmp(raw, "None") == 0) return "BLOCKS: \"None\" in clear";
+    char dec[48];
+    memcpy(dec, raw, sizeof(dec));
+    pxUnmask(dec, len);
+    if (strcmp(dec, "None") == 0) return "BLOCKS: \"None\" unmasked";
+    for (uint32_t i = 0; i < len; i++) if (dec[i] < 0x20 || dec[i] > 0x7E) return "";
+    return "name entry";
 }
 
-static BOOL pxFindNamePool(void) {
-    const uint8_t kNone[8] = { 0x08, 0x00, 'N', 'o', 'n', 'e', 0x00, 0x00 };
-    BOOL found = NO;
-    g_nameHits = 0;
+// One-shot reconnaissance, written once per process and only when the probes
+// below failed. It answers the only open question -- which offset inside each
+// global holds the block list / the chunk slot -- without guessing again.
+static void pxDumpGlobals(void) {
+    if (g_dumped || !g_imgBase) return;
+    g_dumped = YES;
+    pxBuildRanges();
 
-    pxScanWritable([&](uint64_t p, uint64_t v) {
-        if (found) return;
-        if (v < 0x10000 || v > 0x00007FFFFFFFFFFFULL) return;
-        if (v & 7) return;
-        if (!pxInFast(v, 8)) return;
-
-        const uint8_t *b = (const uint8_t *)v;
-        if (memcmp(b, kNone, 6) != 0) return;
-        g_nameHits++;
-
-        // Blocks[0] found. Validate the next few slots look like a pool.
-        int good = 0;
-        for (int k = 1; k <= 4; k++) {
-            uint64_t nb = 0;
-            if (!pxRd64(p + (uint64_t)k * 8, &nb)) break;
-            if (nb == 0) { good++; continue; }
-            if (pxIn(nb, 16)) good++;
+    if (g_namePool) {
+        PxUELog(@"dump GNames 0x%llX", g_namePool);
+        for (int off = 0; off < 0x60; off += 8) {
+            uint64_t v = 0;
+            if (!pxRd64(g_namePool + (uint64_t)off, &v)) {
+                PxUELog(@"  +%02X <unreadable>", off);
+                continue;
+            }
+            const char *where = pxInHostData(v, 1) ? "->image" : "";
+            PxUELog(@"  +%02X %016llX %-6s %s", off, v, where, pxNameHint(v));
         }
-        if (good < 1) return;
+    }
 
-        g_nameBlocks = p;
-        g_nameCrypted = NO;    // the raw bytes already spelled "None"
-        char tmp[16];
-        if (pxNameAt(0, tmp, sizeof(tmp)) && strcmp(tmp, "None") == 0) { found = YES; return; }
-        g_nameBlocks = 0;
-    });
-    return found;
+    if (g_uobjArray) {
+        // Stock layout puts MaxElements/NumElements just past the chunk slot;
+        // the shipped cheat reads them just before. Print both windows.
+        PxUELog(@"dump GObjects 0x%llX", g_uobjArray);
+        for (int off = -8; off < 0x40; off += 8) {
+            int64_t at = (int64_t)g_uobjArray + off;
+            uint64_t v = 0;
+            if (at <= 0 || !pxRd64((uint64_t)at, &v)) continue;
+            uint32_t maxE = 0, numE = 0;
+            pxRd32((uint64_t)at + 8, &maxE);
+            pxRd32((uint64_t)at + 12, &numE);
+            BOOL slot = v && !(v & 7) && pxInFast(v, 8) &&
+                        numE >= 1000 && numE <= 0x800000 && maxE >= numE;
+            PxUELog(@"  %+03d %016llX max=%u num=%u %s",
+                    off, v, maxE, numE, slot ? "<== Objects slot" : "");
+        }
+    }
 }
 
 static BOOL pxProbeObjectArray(uint64_t slot, int32_t maxDelta, int32_t numDelta,
@@ -487,45 +487,6 @@ static BOOL pxProbeObjectArray(uint64_t slot, int32_t maxDelta, int32_t numDelta
 
     if (numOut) *numOut = numE;
     return YES;
-}
-
-static BOOL pxFindObjectArray(void) {
-    BOOL found = NO;
-    g_objHits = 0;
-    g_objProbes = 0;
-
-    pxScanWritable([&](uint64_t p, uint64_t v) {
-        if (found) return;
-        if (v < 0x10000 || v > 0x00007FFFFFFFFFFFULL) return;
-        if (v & 7) return;
-        if (!pxInFast(v, 8)) return;
-
-        // Stock TUObjectArray keeps the counts after the chunk list; the
-        // shipped cheat reads them before it. Prefer the first that probes
-        // clean and keep the other as a calibration fallback.
-        static const int32_t kMaxDelta[] = { 0x10, 8, -0xC };
-        static const int32_t kNumDelta[] = { 0x14, 12, -8 };
-        int picked = -1;
-        g_arrHasAlt = NO;
-        for (int v2 = 0; v2 < 3; v2++) {
-            uint32_t num = 0;
-            g_objProbes++;
-            if (!pxProbeObjectArray(p, kMaxDelta[v2], kNumDelta[v2], &num)) continue;
-            if (picked < 0) {
-                picked = v2;
-                g_objArray = p;
-                g_arrMaxDelta = kMaxDelta[v2];
-                g_arrNumDelta = kNumDelta[v2];
-                g_objCount = num;
-            } else {
-                g_altMaxDelta = kMaxDelta[v2];
-                g_altNumDelta = kNumDelta[v2];
-                g_arrHasAlt = YES;
-            }
-        }
-        if (picked >= 0) { g_objHits++; found = YES; }
-    });
-    return found;
 }
 
 // ------------------------------------------------------- static pointers --
@@ -653,39 +614,57 @@ static void pxResolveStatics(void) {
     }
 
     uint64_t namesAddr = g_namePool, objAddr = g_uobjArray;
+    int blkOff = -1, objOff = -1;
 
     if (namesAddr) {
-        static const uint32_t kOff[] = { 0x38, 0x40 };
-        for (int i = 0; i < 2 && !g_nameBlocks; i++) {
-            uint64_t cand = namesAddr + kOff[i];
-            uint64_t deref = 0;
-            if (pxPoolWorks(cand, &g_nameCrypted)) {
-                g_nameBlocks = cand;
-            } else if (pxRd64(cand, &deref) && deref && pxPoolWorks(deref, &g_nameCrypted)) {
-                g_nameBlocks = deref;
+        // Blocks[] sits somewhere in the first 0x60 bytes, and that offset moves
+        // between builds: the shipped profile used 0x38, and this binary answers
+        // nothing there (every run logged pool=0x0). Probe every aligned slot,
+        // on both readings of the global -- an inline FNamePool, or a pointer to
+        // one -- and keep the first whose index 0 decodes to "None".
+        uint64_t bases[2] = { namesAddr, 0 };
+        uint64_t first = 0;
+        if (pxRd64(namesAddr, &first) && first && !(first & 7) && pxIn(first, 8)) bases[1] = first;
+
+        for (int b = 0; b < 2 && !g_nameBlocks; b++) {
+            for (uint32_t off = 0x10; bases[b] && off <= 0x60; off += 8) {
+                if (!pxPoolWorks(bases[b] + off, &g_nameCrypted)) continue;
+                g_nameBlocks = bases[b] + off;
+                blkOff = (int)off;
+                break;
             }
         }
     }
 
     if (objAddr) {
-        // FUObjectArray::ObjObjects then TUObjectArray::Objects; the counts sit
-        // around the chunk slot, which pxProbeObjectArray already knows how to
-        // score. Fall back to a read-back if the strict probe says no.
-        static const uint32_t kSlot[]     = { 0x20, 0x10 };
+        // Objects/max/num move together, but which slot holds the chunk list is
+        // build-specific too. Widen the slot search instead of trusting one.
+        static const uint32_t kSlot[]     = { 0x10, 0x08, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40 };
         static const int32_t  kMaxDelta[] = { 0x10, 8, -0xC };
         static const int32_t  kNumDelta[] = { 0x14, 12, -8 };
+        const int kSlots = (int)(sizeof(kSlot) / sizeof(kSlot[0]));
 
-        for (int s = 0; s < 2 && !g_objArray; s++) {
+        g_arrHasAlt = NO;
+        for (int s = 0; s < kSlots && !g_objArray; s++) {
+            int hits = 0;
             for (int d = 0; d < 3; d++) {
                 uint32_t num = 0;
                 if (!pxProbeObjectArray(objAddr + kSlot[s], kMaxDelta[d], kNumDelta[d], &num)) continue;
-                g_objArray = objAddr + kSlot[s];
-                g_arrMaxDelta = kMaxDelta[d];
-                g_arrNumDelta = kNumDelta[d];
-                g_objCount = num;
-                break;
+                if (hits++ == 0) {
+                    g_objArray = objAddr + kSlot[s];
+                    g_arrMaxDelta = kMaxDelta[d];
+                    g_arrNumDelta = kNumDelta[d];
+                    g_objCount = num;
+                    objOff = (int)kSlot[s];
+                } else {
+                    g_altMaxDelta = kMaxDelta[d];
+                    g_altNumDelta = kNumDelta[d];
+                    g_arrHasAlt = YES;
+                    break;
+                }
             }
         }
+
         if (!g_objArray) {
             g_objArray = objAddr + kSlot[0];
             g_arrMaxDelta = kMaxDelta[0];
@@ -698,8 +677,8 @@ static void pxResolveStatics(void) {
         }
     }
 
-    PxUELog(@"statics: GNames=0x%llX pool=0x%llX crypted=%d GObjects=0x%llX chunks=0x%llX count=0x%X",
-            namesAddr, g_nameBlocks, (int)g_nameCrypted, objAddr, g_objArray, g_objCount);
+    PxUELog(@"statics: GNames=0x%llX pool=0x%llX at=+0x%X crypted=%d GObjects=0x%llX chunks=0x%llX at=+0x%X count=0x%X",
+            namesAddr, g_nameBlocks, blkOff, (int)g_nameCrypted, objAddr, g_objArray, objOff, g_objCount);
 }
 
 // ------------------------------------------------------------- calibration --
@@ -1172,21 +1151,18 @@ static void pxDumpSDK(NSMutableString *summary) {
 }
 
 - (void)scanOnce {
-    pxBuildRanges();                 // the heap grows between attempts
+    // Statics only. Both globals come from decoding the ADRL pairs that reach
+    // them, so there is nothing to walk; every read is bounded to a handful of
+    // slots around an address the pattern already proved.
     if (!g_imgBase && !pxLoadHostImage()) { pxSetStatus(@"host image not found"); return; }
 
-    pxResolveStatics();              // static globals first: no heap walk needed
+    pxResolveStatics();
 
-    if (!g_nameBlocks && !pxFindNamePool()) {
-        pxSetStatus(@"GNames not found");
-        PxUELog(@"GNames miss: %d candidate pointers, %.1f MB in %.0f ms",
-                g_nameHits, g_scanBytes / 1048576.0, g_scanMs);
-        return;
-    }
-    if (!g_objArray && !pxFindObjectArray()) {
-        pxSetStatus(@"GObjects not found");
-        PxUELog(@"GObjects miss: %d hits, %d probes, %.1f MB in %.0f ms",
-                g_objHits, g_objProbes, g_scanBytes / 1048576.0, g_scanMs);
+    if (!g_nameBlocks || !g_objArray) {
+        if (!g_dumped) PxUELog(@"statics incomplete, dumping globals once");
+        pxDumpGlobals();
+        pxSetStatus([NSString stringWithFormat:@"statics incomplete gnames=0x%llX gobjects=0x%llX",
+                     g_nameBlocks, g_objArray]);
         return;
     }
     if (!g_layoutOK && !pxCalibrate()) {
@@ -1574,8 +1550,8 @@ static uint64_t pxLocalPawn(PxVec3 camLoc) {
     [s appendFormat:@"image      0x%llX slide 0x%llX\n", g_imgBase, g_imgSlide];
     [s appendFormat:@"data segs %d, code segs %d, ranges %d (writable %d)\n",
         g_dataCount, g_codeCount, g_rangeCount, pxWritableCount()];
-    [s appendFormat:@"scan        %.1f MB in %.0f ms, attempts %d, nameHits %d, objProbes %d\n",
-        g_scanBytes / 1048576.0, g_scanMs, g_scanAttempts, g_nameHits, g_objProbes];
+    [s appendFormat:@"scan        statics-only, attempts %d, dumped %d\n",
+        g_scanAttempts, (int)g_dumped];
     [s appendString:@"\n== discovered ==\n"];
     [s appendFormat:@"GNames blocks  0x%llX\n", g_nameBlocks];
     [s appendFormat:@"GObjects slot  0x%llX count 0x%X\n", g_objArray, g_objCount];

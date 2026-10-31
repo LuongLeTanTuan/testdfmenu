@@ -158,11 +158,15 @@ static void PxInstallUI(NSInteger attempt) {
         }
 
         @try {
-            // Restore the overlay link from persisted state: the display thread
-            // drives both the ESP draw loop and the periodic skin re-apply.
-            BOOL any = [PxStore boolForKey:@"esp_players"] || [PxStore boolForKey:@"skin_enable"];
-            [[PxOverlay shared] setEnabled:any];
-            PxLog(@"overlay enabled=%d", any);
+            // Never restore the overlay from persisted state. ESP is what killed
+            // the process on the previous build, and because the switch was
+            // saved as on, every later launch died again before the menu could
+            // be reached -- a loop with no way out from the device itself.
+            // The display link still starts here (the skin re-apply rides on
+            // it); only the ESP window stays down until the switch is touched.
+            BOOL persisted = [PxStore boolForKey:@"esp_players"];
+            [[PxOverlay shared] setEnabled:NO];
+            PxLog(@"overlay enabled=0 (persisted esp=%d, deferred to the menu switch)", (int)persisted);
         } @catch (NSException *e) {
             PxLog(@"overlay enable threw: %@", e);
         }
