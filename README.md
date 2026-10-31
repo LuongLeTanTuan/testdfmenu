@@ -7,6 +7,38 @@ placeholders.
 No jailbreak, no Substrate, no injection framework. One dylib, injected into the
 app bundle, re-signed, sideloaded.
 
+## What the shipped binary says
+
+Static pass over the 416 MB `DeltaForceClient` (thin arm64 Mach-O, `__text` 281 MB,
+`__cstring` 21 MB, `__ustring` 17 MB — the engine is linked into the main binary,
+not a framework):
+
+| Fact | Value |
+|---|---|
+| engine | UE4, `CoreUObject` present, 187,517 wide-string literals in `__ustring` |
+| symbol table | stripped (`LC_SYMTAB` header only, 0 symbols) |
+| game content | 9 `.pak` files, 657 MB — class/function names that live in assets are **not** in the binary |
+| `GObjects` / `GNames` | **zero** — `__DATA.__bss` is 10 MB of zeros on disk; both are `malloc`'d at runtime |
+
+Class names that **are** in the binary, and therefore usable as static anchors:
+
+```
+AGPCharacterBase                    AGPPlayerCameraManager
+ACharacterBase                      ADFMPlayerCameraManager
+ABattleFieldCharacter               AGPNetworkPlayerController
+ADFMAICharacter_* (dozens)          ADFMPlayerController
+ABattleFieldPlayerState             APlayerState_Arena
+```
+
+Not in the binary, must be resolved from the live name pool: `SetSkin`,
+`K2_GetActorLocation`, `ModularWeapon*` — those are asset-side `FName`s.
+
+That split decides the design: a hardcoded offset is wrong twice over, because
+the struct offsets differ per build **and** the interesting names are not in the
+file at all. `PxUE4` therefore calibrates at runtime instead — see
+`## What actually runs`.
+
+
 ## Layout
 
 ```

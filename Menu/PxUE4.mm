@@ -797,11 +797,21 @@ static void pxRefreshActors(void) {
     [g_actors removeAllObjects];
 
     if (g_camMgr || g_classCamMgr) {
+        // An exact compare against the base UClass never hits. The shipped class
+        // is "DFMPlayerCameraManager" (the binary registers APlayerCameraManager,
+        // ADFMPlayerCameraManager, AGPPlayerCameraManager), and any subclass of
+        // the base breaks equality the same way. Match the class-name tail, the
+        // same relaxed rule the character scan below already uses.
+        static const char kCamTail[] = "PlayerCameraManager";
         uint64_t cam = 0;
         pxForEachObject([&](uint64_t obj) {
             if (cam) return;
             uint64_t cls = 0;
-            if (!pxRd64(obj + g_classOff, &cls) || cls != g_classCamMgr) return;
+            if (!pxRd64(obj + g_classOff, &cls) || cls == 0) return;
+            char cn[128] = { 0 };
+            if (!pxNameOf(cls, cn, sizeof(cn))) return;
+            size_t n = strlen(cn), k = sizeof(kCamTail) - 1;
+            if (n < k || strcmp(cn + n - k, kCamTail) != 0) return;
             if (!pxIn(obj, 8) || !(*(void **)obj)) return;
             cam = obj;
         });
