@@ -421,20 +421,28 @@ static const char *pxNameHint(uint64_t v) {
 // below failed. It answers the only open question -- which offset inside each
 // global holds the block list / the chunk slot -- without guessing again.
 static void pxDumpGlobals(void) {
-    if (g_dumped || !g_imgBase) return;
+    if (!g_imgBase) return;
+    // Three dumps, not one. The pool fills in during boot and the 6 s dump showed
+    // a struct that was still empty; a single shot at attempt 1 answers nothing
+    // and then stays silent for the rest of the session.
+    static const int kDumpAt[] = { 1, 12, 40 };
+    static int dumpsDone;
+    if (dumpsDone >= 3) return;
+    if (g_scanAttempts < kDumpAt[dumpsDone]) return;
+    dumpsDone++;
     g_dumped = YES;
     pxBuildRanges();
 
     if (g_namePool) {
-        PxUELog(@"dump GNames 0x%llX", g_namePool);
-        for (int off = 0; off < 0x60; off += 8) {
+        PxUELog(@"dump GNames 0x%llX (attempt %d)", g_namePool, (int)g_scanAttempts);
+        for (int off = 0; off < 0x200; off += 8) {
             uint64_t v = 0;
             if (!pxRd64(g_namePool + (uint64_t)off, &v)) {
-                PxUELog(@"  +%02X <unreadable>", off);
+                PxUELog(@"  +%03X <unreadable>", off);
                 continue;
             }
             const char *where = pxInHostData(v, 1) ? "->image" : "";
-            PxUELog(@"  +%02X %016llX %-6s %s", off, v, where, pxNameHint(v));
+            PxUELog(@"  +%03X %016llX %-6s %s", off, v, where, pxNameHint(v));
         }
     }
 
@@ -627,7 +635,11 @@ static void pxResolveStatics(void) {
         if (pxRd64(namesAddr, &first) && first && !(first & 7) && pxIn(first, 8)) bases[1] = first;
 
         for (int b = 0; b < 2 && !g_nameBlocks; b++) {
-            for (uint32_t off = 0x10; bases[b] && off <= 0x60; off += 8) {
+            // 0x200, not 0x60. FNameEntryAllocator starts with a lock, and the
+            // Apple lock object is not the 8-byte Windows one -- the device dump
+            // shows a lock signature already at +04 and another at +14, so
+            // Blocks[] is past where the old window stopped looking.
+            for (uint32_t off = 0x08; bases[b] && off <= 0x200; off += 8) {
                 if (!pxPoolWorks(bases[b] + off, &g_nameCrypted)) continue;
                 g_nameBlocks = bases[b] + off;
                 blkOff = (int)off;
@@ -640,8 +652,13 @@ static void pxResolveStatics(void) {
         // Objects/max/num move together, but which slot holds the chunk list is
         // build-specific too. Widen the slot search instead of trusting one.
         static const uint32_t kSlot[]     = { 0x10, 0x08, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40 };
-        static const int32_t  kMaxDelta[] = { 0x10, 8, -0xC };
-        static const int32_t  kNumDelta[] = { 0x14, 12, -8 };
+        // The last pair is from the device: the dump printed
+        //   -08 0000000000000002  max=100383 num=100382
+        // i.e. MaxElements/NumElements sit at the FUObjectArray base itself and
+        // the chunk list is at +0x20, so from that slot the counters are 0x20
+        // back. Without it every slot failed and GObjects reported count=0x2.
+        static const int32_t  kMaxDelta[] = { 0x10, 8, -0xC, -0x20 };
+        static const int32_t  kNumDelta[] = { 0x14, 12, -8, -0x1C };
         const int kSlots = (int)(sizeof(kSlot) / sizeof(kSlot[0]));
 
         g_arrHasAlt = NO;
