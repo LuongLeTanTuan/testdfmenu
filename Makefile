@@ -1,4 +1,4 @@
-﻿TARGET := iphone:clang:latest:15.0
+﻿TARGET := iphone:clang:latest:14.0
 ARCHS = arm64
 
 # Theos resolves the SDK by name. When that resolution misses, clang and ld fall
@@ -6,7 +6,10 @@ ARCHS = arm64
 # image. dyld on iOS then refuses to load it and the host aborts before any
 # constructor runs -- which is exactly a launch crash with an empty log. Pin the
 # triple so the platform can never depend on SDK discovery.
-PX_TRIPLE = -target arm64-apple-ios15.0
+#
+# 14.0, not 15.0: dyld refuses a dylib whose LC_BUILD_VERSION minos is above the
+# host, and the second device runs 14.8.1.
+PX_TRIPLE = -target arm64-apple-ios14.0
 
 include $(THEOS)/makefiles/common.mk
 
