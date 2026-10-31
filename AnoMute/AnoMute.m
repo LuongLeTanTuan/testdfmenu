@@ -194,11 +194,12 @@ static BOOL AnoLooksTextual(const char *p, size_t n) {
     return printable * 100 >= sample * 90;
 }
 
-static size_t AnoScrub(char *buf, size_t n) {
+static size_t AnoScrub(char *buf, size_t n, NSMutableString *hits) {
     size_t changed = 0;
     for (int k = 0; kAnoFlagKeys[k] != NULL; k++) {
         const char *key = kAnoFlagKeys[k];
         size_t klen = strlen(key);
+        BOOL found = NO;
         for (size_t i = 0; i + klen < n; i++) {
             if (memcmp(buf + i, key, klen) != 0) continue;
             // key must start a token, not sit inside a longer identifier
@@ -220,7 +221,9 @@ static size_t AnoScrub(char *buf, size_t n) {
                 buf[v] = '0';
             }
             changed++;
+            found = YES;
         }
+        if (found && hits) [hits appendFormat:@"%s ", key];
     }
     return changed;
 }
@@ -294,14 +297,21 @@ static void *AnoGetReport(void) {
     AnoDump("raw", p, n);
 
     if (!AnoLooksTextual(p, n)) {
+        AnoLog(@"binary report %zu B, passthrough", n);
         NSLog(@"[AnoMute] binary report (%zu B) — passthrough", n);
         return p;
     }
 
     memcpy(gScrubBuf, p, n);
     gScrubBuf[n] = '\0';
-    size_t changed = AnoScrub(gScrubBuf, n);
+    NSMutableString *hits = [NSMutableString string];
+    size_t changed = AnoScrub(gScrubBuf, n, hits);
     AnoDump("scrubbed", gScrubBuf, n);
+    // The names matter more than the count: a report carrying black_module_macho
+    // or ms_data_crc says which check fired, and a kick that follows one of these
+    // lines is the anti-cheat reacting to something this file already knows about.
+    AnoLog(@"report %zu B, %zu flag(s): %@", n, changed,
+           hits.length ? hits : @"none");
     NSLog(@"[AnoMute] report %zu B, %zu flag(s) neutralised", n, changed);
     return changed ? gScrubBuf : p;
 }

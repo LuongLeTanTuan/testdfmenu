@@ -81,6 +81,32 @@ static void PxHeartbeat(NSInteger tick, NSInteger total) {
     });
 }
 
+// After the UI is up the only remaining question is whether the process is still
+// alive. A boot log that ends on an "alive" line means the app was killed at that
+// second; one that ends on a lifecycle line means it went to the background
+// instead; one that runs to the moment the user noticed means the app never died
+// and the session was dropped on the server.
+static void PxSlowBeat(NSInteger tick) {
+    PxLog(@"alive %ld images=%u", (long)tick, (unsigned)_dyld_image_count());
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        PxSlowBeat(tick + 1);
+    });
+}
+
+static void PxObserveLifecycle(void) {
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    void (^note)(NSNotification *) = ^(NSNotification *n) {
+        PxLog(@"lifecycle %@", n.name);
+    };
+    for (NSString *name in @[ UIApplicationDidBecomeActiveNotification,
+                              UIApplicationWillResignActiveNotification,
+                              UIApplicationDidEnterBackgroundNotification,
+                              UIApplicationWillTerminateNotification ]) {
+        [nc addObserverForName:name object:nil queue:[NSOperationQueue mainQueue] usingBlock:note];
+    }
+}
+
 // Cosmetic problems in the menu must never abort the host app. This used to be
 // NSCAssert, which is live in a release Theos build (NS_BLOCK_ASSERTIONS is not
 // set), so a single bad key killed the game ~1.5 s after launch.
@@ -149,6 +175,12 @@ static void PxInstallUI(NSInteger attempt) {
         }
 
         PxLog(@"install done");
+        static BOOL beatStarted;
+        if (!beatStarted) {
+            beatStarted = YES;
+            PxObserveLifecycle();
+            PxSlowBeat(0);
+        }
         if (marker) [[NSFileManager defaultManager] removeItemAtPath:marker error:nil];
         return;
     }
