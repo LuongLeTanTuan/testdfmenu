@@ -49,6 +49,19 @@ static UIWindow *PxKeyWindow(void) {
     return nil;
 }
 
+// A boot that never reached "install done" took the process down before the log
+// could be read. Refuse to install on the next launch so the user always gets a
+// second, log-producing boot instead of a loop that never yields evidence.
+static NSString *PxMarkerPath(void) {
+    static NSString *path;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        path = docs ? [docs stringByAppendingPathComponent:@"PxBoot.inprogress"] : nil;
+    });
+    return path;
+}
+
 // Cosmetic problems in the menu must never abort the host app. This used to be
 // NSCAssert, which is live in a release Theos build (NS_BLOCK_ASSERTIONS is not
 // set), so a single bad key killed the game ~1.5 s after launch.
@@ -83,6 +96,9 @@ static void PxInstallUI(NSInteger attempt) {
     if (key && key.rootViewController) {
         PxLog(@"install attempt %ld: key window %@", (long)attempt, NSStringFromCGRect(key.bounds));
 
+        NSString *marker = PxMarkerPath();
+        if (marker) [@"" writeToFile:marker atomically:NO encoding:NSUTF8StringEncoding error:nil];
+
         @try {
             PxSelfCheck();
         } @catch (NSException *e) {
@@ -114,6 +130,7 @@ static void PxInstallUI(NSInteger attempt) {
         }
 
         PxLog(@"install done");
+        if (marker) [[NSFileManager defaultManager] removeItemAtPath:marker error:nil];
         return;
     }
 
@@ -141,6 +158,17 @@ static void PxObserveForeground(void) {
 __attribute__((constructor))
 static void PxMenuInit(void) {
     PxLog(@"=== PxMenu constructor, %u dyld images ===", (unsigned)_dyld_image_count());
+
+    // The marker is written just before the UI installs and removed once it
+    // succeeds, so its presence here means the previous boot died mid-install.
+    // Skip this launch entirely: the menu is not worth a crash loop that never
+    // leaves a readable log.
+    NSString *marker = PxMarkerPath();
+    if (marker && [[NSFileManager defaultManager] fileExistsAtPath:marker]) {
+        [[NSFileManager defaultManager] removeItemAtPath:marker error:nil];
+        PxLog(@"previous boot did not reach install done -- menu skipped this launch");
+        return;
+    }
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{

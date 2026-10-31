@@ -26,9 +26,14 @@ jobs:
             test -f ".theos/obj/$n.dylib" || { echo "missing $n.dylib"; exit 1; }
           done
           ls -lh .theos/obj/*.dylib
+          # A dylib stamped for macOS is silently unloadable on iOS: dyld refuses
+          # the image and the host app aborts at launch, before our constructor
+          # ever runs. That shipped once. It does not ship again.
           for f in .theos/obj/*.dylib; do
             echo "--- $f"
-            xcrun vtool -show-build "$f" 2>/dev/null | head -5 || true
+            xcrun vtool -show-build "$f"
+            plat=$(xcrun vtool -show-build "$f" | awk '/platform/{print $2; exit}')
+            test "$plat" = "IOS" || { echo "REJECT: $f platform='$plat', want IOS"; exit 1; }
           done
 
       - name: Upload dylibs
