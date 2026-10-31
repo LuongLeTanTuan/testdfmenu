@@ -221,7 +221,11 @@ static PxTab *pxBuildSkinTab(void) {
 
     NSMutableArray<NSString *> *weaponNames = [NSMutableArray arrayWithCapacity:kPxWeaponCount];
     for (uint32_t i = 0; i < kPxWeaponCount; i++) {
-        [weaponNames addObject:[NSString stringWithUTF8String:kPxWeaponNames[i]]];
+        const char *wn = kPxWeaponNames[i];
+        // stringWithUTF8String: returns nil on a non-UTF-8 byte and addObject:nil
+        // raises NSInvalidArgumentException, which is an instant crash on launch.
+        NSString *s = wn ? [NSString stringWithUTF8String:wn] : nil;
+        [weaponNames addObject:s ?: [NSString stringWithFormat:@"Weapon %u", i + 1]];
     }
 
     NSInteger currentWpnIdx = [PxStore integerForKey:@"skin_weapon_idx"];
@@ -232,11 +236,8 @@ static PxTab *pxBuildSkinTab(void) {
         NSMutableArray<NSString *> *list = [NSMutableArray arrayWithCapacity:count];
         for (uint32_t s = 0; s < count; s++) {
             const PxSkinEntry *entry = pxSkinForWeaponAt(wIdx, s);
-            if (entry && entry->name) {
-                [list addObject:[NSString stringWithUTF8String:entry->name]];
-            } else {
-                [list addObject:[NSString stringWithFormat:@"Skin #%u", s + 1]];
-            }
+            NSString *sn = (entry && entry->name) ? [NSString stringWithUTF8String:entry->name] : nil;
+            [list addObject:sn ?: [NSString stringWithFormat:@"Skin #%u", s + 1]];
         }
         if (list.count == 0) [list addObject:@"Default / None"];
         return list;

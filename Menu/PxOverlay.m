@@ -34,6 +34,13 @@
         window.rootViewController = [[UIViewController alloc] init];
         window.rootViewController.view.backgroundColor = [UIColor clearColor];
         window.rootViewController.view.userInteractionEnabled = NO;
+        // A window created without a scene on iOS 13+ stays detached and never
+        // draws, even with hidden = NO.
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]]) { window.windowScene = (UIWindowScene *)s; break; }
+            }
+        }
         window.hidden = NO;
         [window.rootViewController.view addSubview:overlay];
         overlay.window = window;

@@ -28,7 +28,14 @@ static NSString * const kPxButtonYKey = @"px_btn_y";
         instance.backgroundColor = [UIColor clearColor];
         instance.rootViewController = [[UIViewController alloc] init];
         instance.rootViewController.view.backgroundColor = [UIColor clearColor];
+        // Same reason as PxOverlay: no scene means the window never appears.
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]]) { instance.windowScene = (UIWindowScene *)s; break; }
+            }
+        }
         [instance buildButton];
+        instance.hidden = NO;
     });
     return instance;
 }
