@@ -14,6 +14,9 @@
 #import <mach/mach.h>
 #import <mach/vm_region.h>
 #import <dlfcn.h>
+#import <fcntl.h>
+#import <stdio.h>
+#import <unistd.h>
 #import <stdarg.h>
 #import <string.h>
 #import <stdlib.h>
@@ -477,12 +480,43 @@ static BOOL AnoRebindInAnogs(const char *want, void *replacement, void **outOrig
     return any;
 }
 
+// Raw file writer for the wrappers below. AnoLog goes through NSString and
+// NSFileHandle, and those reach dlopen/dlsym on first use -- which is exactly
+// the slot being wrapped, so the wrapper re-enters itself and the stack dies.
+// open/write/close are plain syscalls: nothing here can call back into anogs.
+static char gRawPath[512];
+static volatile int gRawArmed;
+
+static void AnoRawLog(const char *s) {
+    if (!gRawArmed || !s || !gRawPath[0]) return;
+    int fd = open(gRawPath, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd < 0) return;
+    write(fd, "[AnoMute] ", 11);
+    write(fd, s, strlen(s));
+    write(fd, "\n", 1);
+    close(fd);
+}
+
+static void AnoArmRawLog(void) {
+    if (gRawArmed) return;
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    if (!docs) return;
+    NSString *p = [docs stringByAppendingPathComponent:@"PxBoot.log"];
+    if (!p || ![p getFileSystemRepresentation:gRawPath maxLength:sizeof(gRawPath)]) return;
+    gRawArmed = 1;
+}
+
 // One line per function on first sight, then one per 256 calls: a scan loop can
 // call these thousands of times and a log that size cannot be read on a phone.
-#define ANO_TRACE(fmt, ...) do { \
+#define ANO_TRACE(...) do { \
     static int n_; \
-    if (n_ == 0 || (n_ & 0xFF) == 0) \
-        AnoLog(@"telemetry #%d %@", n_, [NSString stringWithFormat:fmt, ##__VA_ARGS__]); \
+    if (n_ == 0 || (n_ & 0xFF) == 0) { \
+        char b_[512]; \
+        snprintf(b_, sizeof(b_), __VA_ARGS__); \
+        char l_[560]; \
+        snprintf(l_, sizeof(l_), "#%d %s", n_, b_); \
+        AnoRawLog(l_); \
+    } \
     n_++; \
 } while (0)
 
@@ -490,63 +524,56 @@ static int (*gRealTaskInfo)(task_t, task_flavor_t, task_info_t, mach_msg_type_nu
 static kern_return_t (*gRealRegionRecurse)(vm_map_t, vm_address_t *, vm_size_t *,
                                            natural_t *, vm_region_recurse_info_t,
                                            mach_msg_type_number_t *);
-static void *(*gRealDlopen)(const char *, int);
-static void *(*gRealDlsym)(void *, const char *);
 static int (*gRealSysctlByName)(const char *, void *, size_t *, void *, size_t);
 static void *(*gRealMemmem)(const void *, size_t, const void *, size_t);
-static kern_return_t (*gRealVmRead)(vm_map_read_t, vm_address_t, vm_offset_t *,
-                                    mach_msg_type_number_t *);
+// Five arguments, not four. The old declaration dropped `size`, so every call
+// shifted one register and handed vm_read a pointer where a length belongs.
+static kern_return_t (*gRealVmRead)(vm_map_read_t, vm_address_t, vm_size_t,
+                                    vm_offset_t *, mach_msg_type_number_t *);
 
 static int AnoTaskInfo(task_t t, task_flavor_t f, task_info_t out, mach_msg_type_number_t *cnt) {
     // TASK_DYLD_INFO (17) hands back dyld_all_image_infos, which is a second,
     // independent image list that rebinding _dyld_* does not touch.
-    if (f == 17) ANO_TRACE(@"task_info(TASK_DYLD_INFO)");
+    if (f == 17) ANO_TRACE("task_info(TASK_DYLD_INFO)");
     return gRealTaskInfo ? gRealTaskInfo(t, f, out, cnt) : KERN_FAILURE;
 }
 
 static kern_return_t AnoRegionRecurse(vm_map_t m, vm_address_t *a, vm_size_t *s, natural_t *d,
                                       vm_region_recurse_info_t i, mach_msg_type_number_t *c) {
-    ANO_TRACE(@"vm_region_recurse_64 at=0x%llX depth=%u",
+    ANO_TRACE("vm_region_recurse_64 at=0x%llX depth=%u",
               (unsigned long long)*a, d ? *d : 0u);
     return gRealRegionRecurse ? gRealRegionRecurse(m, a, s, d, i, c) : KERN_FAILURE;
 }
 
 // mach_vm_region_recurse is not in the iOS SDK (mach_vm.h is macOS-only), and
 // vm_region_recurse_64 covers the same walk, so that one is watched instead.
-static void *AnoDlopen(const char *path, int mode) {
-    ANO_TRACE(@"dlopen %s", path ? path : "(null)");
-    return gRealDlopen ? gRealDlopen(path, mode) : NULL;
-}
-
-static void *AnoDlsym(void *h, const char *sym) {
-    ANO_TRACE(@"dlsym %s", sym ? sym : "(null)");
-    return gRealDlsym ? gRealDlsym(h, sym) : NULL;
-}
-
+//
+// _dlopen and _dlsym are deliberately not wrapped. anogs calls them while it is
+// itself being loaded, and anything our wrapper does that lazily binds a symbol
+// re-enters the same slot on the same thread -- a deadlock at launch, which the
+// system kills and the phone reports as a crash. Losing those two lines of
+// telemetry is cheaper than losing the app.
 static int AnoSysctlByName(const char *name, void *oldp, size_t *oldlenp,
                            void *newp, size_t newlen) {
     // kern.proc.pid.* / kern.procargs expose P_TRACED and the argument vector.
-    ANO_TRACE(@"sysctlbyname %s", name ? name : "(null)");
+    ANO_TRACE("sysctlbyname %s", name ? name : "(null)");
     return gRealSysctlByName ? gRealSysctlByName(name, oldp, oldlenp, newp, newlen) : -1;
 }
 
 static void *AnoMemmem(const void *hay, size_t hn, const void *needle, size_t nn) {
-    ANO_TRACE(@"memmem hay=%zu needle=%zu", hn, nn);
+    ANO_TRACE("memmem hay=%zu needle=%zu", hn, nn);
     return gRealMemmem ? gRealMemmem(hay, hn, needle, nn) : NULL;
 }
 
-static kern_return_t AnoVmRead(vm_map_read_t t, vm_address_t a, vm_offset_t *data,
-                               mach_msg_type_number_t *cnt) {
-    ANO_TRACE(@"vm_read at=0x%llX size=%u", (unsigned long long)a,
-              cnt ? (unsigned)*cnt : 0u);
-    return gRealVmRead ? gRealVmRead(t, a, data, cnt) : KERN_FAILURE;
+static kern_return_t AnoVmRead(vm_map_read_t t, vm_address_t a, vm_size_t sz,
+                               vm_offset_t *data, mach_msg_type_number_t *cnt) {
+    ANO_TRACE("vm_read at=0x%llX size=%u", (unsigned long long)a, (unsigned)sz);
+    return gRealVmRead ? gRealVmRead(t, a, sz, data, cnt) : KERN_FAILURE;
 }
 
 static void AnoInstallTelemetry(void) {
     gRealTaskInfo         = dlsym(RTLD_DEFAULT, "task_info");
     gRealRegionRecurse    = dlsym(RTLD_DEFAULT, "vm_region_recurse_64");
-    gRealDlopen           = dlsym(RTLD_DEFAULT, "dlopen");
-    gRealDlsym            = dlsym(RTLD_DEFAULT, "dlsym");
     gRealSysctlByName     = dlsym(RTLD_DEFAULT, "sysctlbyname");
     gRealMemmem           = dlsym(RTLD_DEFAULT, "memmem");
     gRealVmRead           = dlsym(RTLD_DEFAULT, "vm_read");
@@ -554,12 +581,10 @@ static void AnoInstallTelemetry(void) {
     int n = 0;
     if (gRealTaskInfo && AnoRebindInAnogs("_task_info", (void *)AnoTaskInfo, NULL)) n++;
     if (gRealRegionRecurse && AnoRebindInAnogs("_vm_region_recurse_64", (void *)AnoRegionRecurse, NULL)) n++;
-    if (gRealDlopen && AnoRebindInAnogs("_dlopen", (void *)AnoDlopen, NULL)) n++;
-    if (gRealDlsym && AnoRebindInAnogs("_dlsym", (void *)AnoDlsym, NULL)) n++;
     if (gRealSysctlByName && AnoRebindInAnogs("_sysctlbyname", (void *)AnoSysctlByName, NULL)) n++;
     if (gRealMemmem && AnoRebindInAnogs("_memmem", (void *)AnoMemmem, NULL)) n++;
     if (gRealVmRead && AnoRebindInAnogs("_vm_read", (void *)AnoVmRead, NULL)) n++;
-    AnoLog(@"telemetry: %d/7 detection imports rebound", n);
+    AnoLog(@"telemetry: %d/5 detection imports rebound", n);
 }
 
 #pragma mark - install
@@ -633,9 +658,18 @@ static void AnoInstall(NSInteger attempt) {
     BOOL any = NO;
     gAnoScanned = gAnoSkipped = 0;
     AnoLog(@"walk begin, %u images", _dyld_image_count());
-    // anogs is mapped by now, so the slots exist. Placed before the report
-    // rebinds so a scan that fires during install is already covered.
-    AnoInstallTelemetry();
+    // anogs is mapped, but mapped is not the same as finished initialising: its
+    // constructor is still running on this thread and calls these very imports.
+    // Rebinding its slots from inside that window is what took the app down at
+    // launch. Three seconds is past the constructor and hours before a match.
+    AnoArmRawLog();
+    static dispatch_once_t onceTelemetry;
+    dispatch_once(&onceTelemetry, ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            AnoInstallTelemetry();
+        });
+    });
     any |= AnoRebindEverywhere("_AnoSDKGetReportData",  (void *)AnoGetReport, &tmp);
     any |= AnoRebindEverywhere("_AnoSDKGetReportData2", (void *)AnoGetReport, NULL);
     any |= AnoRebindEverywhere("_AnoSDKGetReportData3", (void *)AnoGetReport, NULL);
