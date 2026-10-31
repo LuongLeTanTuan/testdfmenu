@@ -550,27 +550,37 @@ static const void * const kPxControlKey = &kPxControlKey;
     self.hidden = YES;
     [self removeFromSuperview];
 
-    UIView *host = self.hostWindow.rootViewController.view;
-    host.userInteractionEnabled = NO;
-    self.hostWindow.hidden = YES;
+    UIWindow *gone = self.hostWindow;
+    gone.rootViewController.view.userInteractionEnabled = NO;
+    gone.hidden = YES;
     // Detach from the scene too. A merely hidden window still sits in the app's
     // window list; anything that un-hides it later becomes a full-screen touch
     // blocker with nothing drawn on it, which is the "nothing responds" report.
-    if (@available(iOS 13.0, *)) self.hostWindow.windowScene = nil;
-
-    UIWindow *prev = self.prevKey;
-    self.prevKey = nil;
-    // Hand key back to the host. A window that was never key still takes the
-    // touch layer while it is up, and the game does not always reclaim it.
-    if (prev && !prev.hidden) [prev makeKeyWindow];
+    if (@available(iOS 13.0, *)) gone.windowScene = nil;
+    // Drop it. Keeping the object around meant showMenu re-attached a window the
+    // system had already been told to forget, and the game could end up with a
+    // level-2060 window on top of it that nobody could dismiss.
+    self.hostWindow = nil;
 
     [self stopDisplayLink];
+
+    // Hand key back to the host: the lowest-level visible window that is not
+    // ours. Calling makeKeyWindow on whatever was key before is not enough --
+    // that can be our own overlay at level 2050, which then stays key and takes
+    // the keyboard and rotation path away from the game.
+    UIWindow *target = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.hidden || w.windowLevel >= UIWindowLevelAlert) continue;
+        if (!target || w.windowLevel < target.windowLevel) target = w;
+    }
+    if (target) [target makeKeyWindow];
+    self.prevKey = nil;
 
     NSInteger visible = 0;
     for (UIWindow *w in [UIApplication sharedApplication].windows) if (!w.hidden) visible++;
     PxLogShared(@"menu hidden, windows=%lu visible=%ld key=%@",
                 (unsigned long)[UIApplication sharedApplication].windows.count,
-                (long)visible, prev);
+                (long)visible, target);
 }
 
 - (void)toggleMenu {

@@ -56,19 +56,20 @@ static NSString * const kPxButtonYKey = @"px_btn_y";
     [self.button addGestureRecognizer:pan];
 }
 
-// The key window, preferring one that already has a scene and a visible size.
-// [UIApplication windows] is deprecated but still the only call that returns the
-// host's window when the game never adopts a scene delegate.
+// The key window, but never one of ours. Our overlay sits at UIWindowLevelAlert
+// + 50 and the menu at + 60; the game is at level 0. The first version asked for
+// "the key window" and got the ESP overlay -- the log proved it:
+//   button attach: host=UIWindow level=2050
+// and that window's whole view tree is userInteractionEnabled = NO, so the PX
+// button rendered fine and could never be tapped again.
 static UIWindow *PxHostWindow(void) {
-    UIWindow *fallback = nil;
+    UIWindow *best = nil;
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
         if (w.hidden) continue;
-        if (!fallback) fallback = w;
-        if (w.isKeyWindow) return w;
+        if (w.windowLevel >= UIWindowLevelAlert) continue;   // ours, not the host
+        if (!best || w.windowLevel < best.windowLevel) best = w;
     }
-    if (fallback) return fallback;
-    for (UIWindow *w in [UIApplication sharedApplication].windows) return w;
-    return nil;
+    return best;
 }
 
 - (void)showButton {

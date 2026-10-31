@@ -53,6 +53,10 @@ static UIWindowScene *PxActiveScene(void) {
         window.rootViewController = [[UIViewController alloc] init];
         window.rootViewController.view.backgroundColor = [UIColor clearColor];
         window.rootViewController.view.userInteractionEnabled = NO;
+        // Belt and braces: the root view already refuses touches, but the window
+        // itself defaults to YES and a visible full-screen window at level 2050
+        // sitting above the game is the last thing the touch router should meet.
+        window.userInteractionEnabled = NO;
         // A window created without a scene on iOS 13+ stays detached and never
         // draws, even with hidden = NO.
         if (@available(iOS 13.0, *)) {
@@ -92,6 +96,15 @@ static UIWindowScene *PxActiveScene(void) {
 
     self.tick++;
     if (![PxUE4 shared].ready) [[PxUE4 shared] scanIfNeeded];
+
+    // The window is only allowed on screen when it can actually draw something.
+    // Leaving a full-screen transparent window at level 2050 up while the ESP has
+    // nothing to show is how the game ends up feeling like it stopped taking
+    // touches: the window is above it, it is interactive at the window level, and
+    // it paints nothing. The display link is independent of window visibility, so
+    // the skin re-apply below still runs with the window hidden.
+    BOOL want = self.enabled && [PxUE4 shared].ready;
+    if (self.window && self.window.hidden == want) self.window.hidden = !want;
 
     // Mod skin: descriptor changes when the held weapon changes or the player
     // respawns, so re-send the id every 2 s while auto re-apply is on.
